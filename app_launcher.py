@@ -7,6 +7,7 @@ import sys
 import signal
 import queue
 import time
+import shutil
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from datetime import datetime
@@ -17,6 +18,7 @@ SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_la
 DEFAULT_MAVEN_PATH = "mvn"
 DEFAULT_JAVA_PATH = "java"
 DEFAULT_NODE_PATH = "npm"
+CONSOLE_LOG4J2_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "log4j2-console.xml")
 
 
 class ProcessManager:
@@ -116,21 +118,49 @@ class ProjectTab:
         )
         self.output_queue = queue.Queue()
         self.config = config or self._default_config()
+        self._log_font_size = int(self.config.get("log_font_size", 12))
+        self._saved_sash_ratio = self.config.get("sash_ratio", 0.5)
 
         # --- Main Frame ---
         self.frame = ctk.CTkFrame(parent_notebook)
-
-        # --- Split Pane: Logs (left 50%) | Settings (right 50%) ---
-        self.frame.grid_columnconfigure(0, weight=1, uniform="pane")
-        self.frame.grid_columnconfigure(1, weight=0)
-        self.frame.grid_columnconfigure(2, weight=1, uniform="pane")
         self.frame.grid_rowconfigure(0, weight=1)
+        self.frame.grid_columnconfigure(0, weight=1)
+
+        # --- Draggable PanedWindow ---
+        self.paned = tk.PanedWindow(self.frame, orient=tk.HORIZONTAL, sashwidth=6,
+                                    sashrelief=tk.FLAT, bg="#3b3b3b",
+                                    opaqueresize=True)
+        self.paned.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
 
         self._build_log_panel()
-        self._build_separator()
         self._build_settings_panel()
 
+        # Add panels to paned window
+        self.paned.add(self.log_outer_frame, stretch="always")
+        self.paned.add(self.settings_outer_frame, stretch="always")
+
+        # Set initial sash from saved ratio
+        self.frame.after(50, self._set_initial_sash)
+
         self._poll_output()
+
+    def _set_initial_sash(self):
+        self.frame.update_idletasks()
+        total_w = self.paned.winfo_width()
+        if total_w > 100:
+            pos = int(total_w * self._saved_sash_ratio)
+            self.paned.sash_place(0, pos, 0)
+
+    def _get_sash_ratio(self):
+        """Get current sash position as a ratio 0-1."""
+        try:
+            total_w = self.paned.winfo_width()
+            if total_w > 100:
+                sash_pos = self.paned.sash_coord(0)[0]
+                return round(sash_pos / total_w, 3)
+        except Exception:
+            pass
+        return 0.5
 
     def _default_config(self):
         return {
@@ -147,17 +177,21 @@ class ProjectTab:
             "maven_extra_args": "",
             "debug_enabled": False,
             "debug_port": "5005",
+            "console_logging": True,
+            "skip_jacoco": True,
             "npm_script": "start",
             "spring_profile": "",
-            "server_port": "8080",
+            "override_port": False,
+            "server_port": "",
         }
 
     # ========================
     # LOG PANEL (LEFT)
     # ========================
     def _build_log_panel(self):
-        log_frame = ctk.CTkFrame(self.frame, corner_radius=10)
-        log_frame.grid(row=0, column=0, sticky="nsew", padx=(8, 3), pady=8)
+        self.log_outer_frame = tk.Frame(self.paned, bg="#2b2b2b")
+        log_frame = ctk.CTkFrame(self.log_outer_frame, corner_radius=10)
+        log_frame.pack(fill="both", expand=True, padx=(4, 2), pady=4)
         log_frame.grid_rowconfigure(1, weight=1)
         log_frame.grid_columnconfigure(0, weight=1)
 
@@ -168,6 +202,23 @@ class ProjectTab:
         self.status_label = ctk.CTkLabel(toolbar, text="● STOPPED", text_color="gray",
                                          font=ctk.CTkFont(size=13, weight="bold"))
         self.status_label.pack(side="left", padx=8)
+
+        # Font size buttons
+        btn_font_minus = ctk.CTkButton(toolbar, text="A-", width=32, height=28, corner_radius=6,
+                                       fg_color=("gray70", "gray35"), hover_color=("gray60", "gray45"),
+                                       font=ctk.CTkFont(size=12, weight="bold"),
+                                       command=self._log_font_decrease)
+        btn_font_minus.pack(side="left", padx=(8, 1))
+
+        self.font_size_label = ctk.CTkLabel(toolbar, text=str(self._log_font_size), width=28,
+                                            font=ctk.CTkFont(size=11))
+        self.font_size_label.pack(side="left", padx=1)
+
+        btn_font_plus = ctk.CTkButton(toolbar, text="A+", width=32, height=28, corner_radius=6,
+                                      fg_color=("gray70", "gray35"), hover_color=("gray60", "gray45"),
+                                      font=ctk.CTkFont(size=12, weight="bold"),
+                                      command=self._log_font_increase)
+        btn_font_plus.pack(side="left", padx=(1, 4))
 
         btn_clear = ctk.CTkButton(toolbar, text="Clear", width=70, height=30, corner_radius=6,
                                   fg_color=("gray70", "gray35"), hover_color=("gray60", "gray45"),
@@ -184,20 +235,65 @@ class ProjectTab:
 
         # Log text
         self.log_text = ctk.CTkTextbox(log_frame, wrap="word", corner_radius=8,
-                                       font=ctk.CTkFont(family="Consolas", size=12),
+                                       font=ctk.CTkFont(family="Consolas", size=self._log_font_size),
                                        state="disabled")
         self.log_text.grid(row=1, column=0, sticky="nsew", padx=6, pady=(3, 6))
 
-    def _build_separator(self):
-        sep = ctk.CTkFrame(self.frame, width=2, fg_color=("gray75", "gray35"))
-        sep.grid(row=0, column=1, sticky="ns", padx=0, pady=10)
+        # Configure color tags
+        self._setup_log_tags()
+
+    def _setup_log_tags(self):
+        """Configure text tags for colored log output."""
+        text_widget = self.log_text._textbox
+        text_widget.tag_configure("error", foreground="#e74c3c")
+        text_widget.tag_configure("warn", foreground="#f39c12")
+        text_widget.tag_configure("info", foreground="#2ecc71")
+        text_widget.tag_configure("debug", foreground="#3498db")
+        text_widget.tag_configure("trace", foreground="#95a5a6")
+        text_widget.tag_configure("system", foreground="#1abc9c", font=("Consolas", self._log_font_size, "bold"))
+        text_widget.tag_configure("exception", foreground="#e67e22")
+
+    def _get_log_tag(self, line):
+        """Determine the color tag for a log line."""
+        upper = line.upper()
+        if any(k in upper for k in ["[ERROR", "ERROR ", "SEVERE", "FATAL"]):
+            return "error"
+        if any(k in upper for k in ["[WARN", "WARN ", "WARNING"]):
+            return "warn"
+        if any(k in upper for k in ["[INFO", "INFO "]):
+            return "info"
+        if any(k in upper for k in ["[DEBUG", "DEBUG "]):
+            return "debug"
+        if any(k in upper for k in ["[TRACE", "TRACE "]):
+            return "trace"
+        if line.startswith(("[RUN]", "[MAVEN]", "[STOP]", "[INFO]")):
+            return "system"
+        if any(k in upper for k in ["EXCEPTION", "CAUSED BY", "\TAT ", "\TAT\T"]):
+            return "exception"
+        return None
+
+    def _log_font_increase(self):
+        self._log_font_size = min(self._log_font_size + 1, 28)
+        self._apply_log_font()
+
+    def _log_font_decrease(self):
+        self._log_font_size = max(self._log_font_size - 1, 8)
+        self._apply_log_font()
+
+    def _apply_log_font(self):
+        self.log_text.configure(font=ctk.CTkFont(family="Consolas", size=self._log_font_size))
+        self.font_size_label.configure(text=str(self._log_font_size))
+        # Update system tag font too
+        self.log_text._textbox.tag_configure("system",
+            font=("Consolas", self._log_font_size, "bold"))
 
     # ========================
     # SETTINGS PANEL (RIGHT)
     # ========================
     def _build_settings_panel(self):
-        settings_outer = ctk.CTkFrame(self.frame, corner_radius=10)
-        settings_outer.grid(row=0, column=2, sticky="nsew", padx=(3, 8), pady=8)
+        self.settings_outer_frame = tk.Frame(self.paned, bg="#2b2b2b")
+        settings_outer = ctk.CTkFrame(self.settings_outer_frame, corner_radius=10)
+        settings_outer.pack(fill="both", expand=True, padx=(2, 4), pady=4)
         settings_outer.grid_rowconfigure(0, weight=1)
         settings_outer.grid_columnconfigure(0, weight=1)
 
@@ -245,8 +341,15 @@ class ProjectTab:
         row = self._add_entry("program_args", "Program Args", row, self.config["program_args"])
         row = self._add_entry("spring_profile", "Spring Profile", row, self.config["spring_profile"],
                               placeholder="dev,local")
+        row = self._add_checkbox("override_port", "Override Server Port", row,
+                                 self.config.get("override_port", False))
         row = self._add_entry("server_port", "Server Port", row, self.config["server_port"],
-                              placeholder="8080")
+                              placeholder="e.g. 8080")
+
+        # --- Group: Logging ---
+        row = self._add_group_header("Logging", row)
+        row = self._add_checkbox("console_logging", "Override logs to Console", row,
+                                 self.config.get("console_logging", True))
 
         # --- Group: Debug ---
         row = self._add_group_header("Debug", row)
@@ -256,6 +359,8 @@ class ProjectTab:
 
         # --- Group: Maven Settings ---
         row = self._add_group_header("Maven Settings", row)
+        row = self._add_checkbox("skip_jacoco", "Skip JaCoCo (recommended)", row,
+                                 self.config.get("skip_jacoco", True))
         row = self._add_path_entry_with_default("maven_path", "Maven Home", row,
                                                 self.config["maven_path"], DEFAULT_MAVEN_PATH)
         row = self._add_entry("maven_profiles", "Maven Profiles", row, self.config["maven_profiles"],
@@ -334,7 +439,7 @@ class ProjectTab:
         btn_default = ctk.CTkButton(inner, text="Default", width=58, height=30, corner_radius=6,
                                     fg_color=("gray70", "gray35"), hover_color=("gray60", "gray45"),
                                     font=ctk.CTkFont(size=11),
-                                    command=lambda: var.set(default_value))
+                                    command=lambda: var.set(""))
         btn_default.grid(row=0, column=2)
 
         self.setting_vars[key] = var
@@ -379,6 +484,8 @@ class ProjectTab:
         cfg = {}
         for key, var in self.setting_vars.items():
             cfg[key] = var.get()
+        cfg["log_font_size"] = self._log_font_size
+        cfg["sash_ratio"] = self._get_sash_ratio()
         return cfg
 
     def _get_java_cmd(self):
@@ -388,7 +495,9 @@ class ProjectTab:
             if os.path.isfile(candidate):
                 return candidate
             return os.path.join(java_path, "bin", "java")
-        return java_path or DEFAULT_JAVA_PATH
+        # Empty or default: find in system PATH
+        found = shutil.which("java")
+        return found if found else "java"
 
     def _get_maven_cmd(self):
         mvn_path = self.setting_vars["maven_path"].get().strip()
@@ -398,7 +507,12 @@ class ProjectTab:
             if os.path.isfile(candidate):
                 return candidate
             return os.path.join(mvn_path, "bin", "mvn")
-        return mvn_path or DEFAULT_MAVEN_PATH
+        # Empty or default: find in system PATH
+        for name in ("mvn.cmd", "mvn") if sys.platform == "win32" else ("mvn",):
+            found = shutil.which(name)
+            if found:
+                return found
+        return "mvn"
 
     def _get_project_path(self):
         return self.setting_vars["project_path"].get() or None
@@ -421,13 +535,17 @@ class ProjectTab:
     def _get_npm_cmd(self):
         node_path = self.setting_vars["node_path"].get().strip()
         if node_path and os.path.isdir(node_path):
-            # Check if it's a nodejs installation directory (contains npm.cmd)
             ext = ".cmd" if sys.platform == "win32" else ""
             for candidate_dir in [node_path, os.path.join(node_path, "bin")]:
                 candidate = os.path.join(candidate_dir, f"npm{ext}")
                 if os.path.isfile(candidate):
                     return candidate
-        return node_path or DEFAULT_NODE_PATH
+        # Empty or default: find in system PATH
+        for name in ("npm.cmd", "npm") if sys.platform == "win32" else ("npm",):
+            found = shutil.which(name)
+            if found:
+                return found
+        return "npm"
 
     def _log(self, text):
         self.output_queue.put(text)
@@ -447,7 +565,13 @@ class ProjectTab:
                     self._update_status(item[1])
                 else:
                     self.log_text.configure(state="normal")
-                    self.log_text.insert("end", item)
+                    # Apply color tags per line
+                    for line in item.splitlines(True):
+                        tag = self._get_log_tag(line)
+                        if tag:
+                            self.log_text._textbox.insert("end", line, tag)
+                        else:
+                            self.log_text._textbox.insert("end", line)
                     self.log_text.see("end")
                     self.log_text.configure(state="disabled")
         except queue.Empty:
@@ -538,17 +662,30 @@ class ProjectTab:
         program_args = self.setting_vars["program_args"].get().strip()
         spring_profile = self.setting_vars["spring_profile"].get().strip()
         server_port = self.setting_vars["server_port"].get().strip()
+        override_port = self.setting_vars["override_port"].get()
         debug_enabled = self.setting_vars["debug_enabled"].get()
         debug_port = self.setting_vars["debug_port"].get().strip()
 
         mvn = self._get_maven_cmd()
         cmd_parts = [mvn, "spring-boot:run"]
 
+        # Skip JaCoCo to avoid instrumentation errors
+        skip_jacoco = self.setting_vars["skip_jacoco"].get()
+        if skip_jacoco:
+            cmd_parts.append("-Djacoco.skip=true")
+
         jvm_args = []
         if vm_options:
             jvm_args.extend(vm_options.split())
         if debug_enabled and debug_port:
             jvm_args.append(f"-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:{debug_port}")
+
+        # Console logging override
+        console_logging = self.setting_vars["console_logging"].get()
+        if console_logging:
+            config_path = CONSOLE_LOG4J2_CONFIG.replace("\\", "/")
+            jvm_args.append(f"-Dlogging.config=file:{config_path}")
+            jvm_args.append(f"-Dlog4j.configurationFile=file:{config_path}")
 
         if main_class:
             cmd_parts.append(f"-Dspring-boot.run.mainClass={main_class}")
@@ -557,7 +694,7 @@ class ProjectTab:
 
         # Collect run arguments
         run_args = []
-        if server_port:
+        if override_port and server_port:
             run_args.append(f"--server.port={server_port}")
         if program_args:
             run_args.extend(program_args.split())
@@ -621,6 +758,14 @@ class AppLauncher(ctk.CTk):
         self._current_theme = saved.get("theme", "dark")
         ctk.set_appearance_mode(self._current_theme)
         ctk.set_default_color_theme("blue")
+
+        # Restore window geometry
+        geometry = saved.get("geometry")
+        if geometry:
+            try:
+                self.geometry(geometry)
+            except Exception:
+                pass
 
         self._build_ui()
 
@@ -784,6 +929,7 @@ class AppLauncher(ctk.CTk):
             })
         return {
             "theme": self._current_theme,
+            "geometry": self.geometry(),
             "tabs": tabs_data,
         }
 
