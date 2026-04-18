@@ -14,11 +14,19 @@ from datetime import datetime
 
 # --- Constants ---
 APP_TITLE = "App Launcher"
-SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_launcher_settings.json")
+# Support PyInstaller bundled mode
+if getattr(sys, 'frozen', False):
+    _BASE_DIR = os.path.dirname(sys.executable)
+    _BUNDLE_DIR = getattr(sys, '_MEIPASS', _BASE_DIR)
+else:
+    _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    _BUNDLE_DIR = _BASE_DIR
+
+SETTINGS_FILE = os.path.join(_BASE_DIR, "app_launcher_settings.json")
 DEFAULT_MAVEN_PATH = "mvn"
 DEFAULT_JAVA_PATH = "java"
 DEFAULT_NODE_PATH = "npm"
-CONSOLE_LOG4J2_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "log4j2-console.xml")
+CONSOLE_LOG4J2_CONFIG = os.path.join(_BUNDLE_DIR, "log4j2-console.xml")
 
 
 class ProcessManager:
@@ -90,11 +98,17 @@ class ProcessManager:
     def stop(self):
         self._stop_event.set()
         if self.process and self.is_running():
+            pid = self.process.pid
             try:
                 if sys.platform == "win32":
-                    self.process.send_signal(signal.CTRL_BREAK_EVENT)
+                    # Kill entire process tree (maven + java child processes)
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(pid)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
                 else:
-                    self.process.terminate()
+                    os.killpg(os.getpgid(pid), signal.SIGTERM)
                 try:
                     self.process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
@@ -139,8 +153,9 @@ class ProjectTab:
         self.paned.add(self.log_outer_frame, stretch="always")
         self.paned.add(self.settings_outer_frame, stretch="always")
 
-        # Set initial sash from saved ratio
-        self.frame.after(50, self._set_initial_sash)
+        # Set initial sash from saved ratio (delayed to ensure widget is mapped)
+        self._sash_retries = 0
+        self.frame.after(200, self._set_initial_sash)
 
         self._poll_output()
 
@@ -150,6 +165,9 @@ class ProjectTab:
         if total_w > 100:
             pos = int(total_w * self._saved_sash_ratio)
             self.paned.sash_place(0, pos, 0)
+        elif self._sash_retries < 10:
+            self._sash_retries += 1
+            self.frame.after(200, self._set_initial_sash)
 
     def _get_sash_ratio(self):
         """Get current sash position as a ratio 0-1."""
@@ -178,6 +196,7 @@ class ProjectTab:
             "debug_enabled": False,
             "debug_port": "5005",
             "console_logging": True,
+            "log_max_lines": "500",
             "skip_jacoco": True,
             "npm_script": "start",
             "spring_profile": "",
@@ -268,7 +287,7 @@ class ProjectTab:
             return "trace"
         if line.startswith(("[RUN]", "[MAVEN]", "[STOP]", "[INFO]")):
             return "system"
-        if any(k in upper for k in ["EXCEPTION", "CAUSED BY", "\TAT ", "\TAT\T"]):
+        if any(k in upper for k in ["EXCEPTION", "CAUSED BY", "\tAT ", "\tAT\t"]):
             return "exception"
         return None
 
@@ -350,6 +369,9 @@ class ProjectTab:
         row = self._add_group_header("Logging", row)
         row = self._add_checkbox("console_logging", "Override logs to Console", row,
                                  self.config.get("console_logging", True))
+        row = self._add_entry("log_max_lines", "Max Log Lines", row,
+                      self.config.get("log_max_lines", "500"),
+                      placeholder="500")
 
         # --- Group: Debug ---
         row = self._add_group_header("Debug", row)
@@ -557,25 +579,52 @@ class ProjectTab:
         self._log(f"\n[Process exited with code {exit_code}]\n")
         self.output_queue.put(("__STATUS__", "stopped"))
 
+    DEFAULT_MAX_LOG_LINES = 500
+
+    def _get_log_max_lines(self):
+        value = self.setting_vars.get("log_max_lines").get().strip()
+        try:
+            parsed = int(value)
+            return max(100, min(parsed, 20000))
+        except Exception:
+            return self.DEFAULT_MAX_LOG_LINES
+
     def _poll_output(self):
+        items = []
         try:
             while True:
-                item = self.output_queue.get_nowait()
-                if isinstance(item, tuple) and item[0] == "__STATUS__":
-                    self._update_status(item[1])
-                else:
-                    self.log_text.configure(state="normal")
-                    # Apply color tags per line
+                items.append(self.output_queue.get_nowait())
+        except queue.Empty:
+            pass
+
+        if items:
+            status_items = [i for i in items if isinstance(i, tuple) and i[0] == "__STATUS__"]
+            text_items = [i for i in items if not (isinstance(i, tuple) and i[0] == "__STATUS__")]
+
+            if text_items:
+                self.log_text.configure(state="normal")
+                tw = self.log_text._textbox
+                for item in text_items:
                     for line in item.splitlines(True):
                         tag = self._get_log_tag(line)
                         if tag:
-                            self.log_text._textbox.insert("end", line, tag)
+                            tw.insert("end", line, tag)
                         else:
-                            self.log_text._textbox.insert("end", line)
-                    self.log_text.see("end")
-                    self.log_text.configure(state="disabled")
-        except queue.Empty:
-            pass
+                            tw.insert("end", line)
+
+                # Trim to configured max line count
+                max_lines = self._get_log_max_lines()
+                line_count = int(tw.index("end-1c").split(".")[0])
+                if line_count > max_lines:
+                    excess = line_count - max_lines
+                    tw.delete("1.0", f"{excess + 1}.0")
+
+                self.log_text.see("end")
+                self.log_text.configure(state="disabled")
+
+            for s in status_items:
+                self._update_status(s[1])
+
         self.frame.after(100, self._poll_output)
 
     def _update_status(self, status):
@@ -747,6 +796,13 @@ class AppLauncher(ctk.CTk):
         self.title(APP_TITLE)
         self.geometry("1400x800")
         self.minsize(900, 500)
+
+        # Set window icon
+        icon_path = os.path.join(_BASE_DIR, "app_icon.ico")
+        if not os.path.exists(icon_path):
+            icon_path = os.path.join(_BUNDLE_DIR, "app_icon.ico")
+        if os.path.exists(icon_path):
+            self.iconbitmap(icon_path)
 
         self.tabs = {}  # tab_id -> ProjectTab
         self._current_theme = "dark"
