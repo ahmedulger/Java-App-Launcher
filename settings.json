@@ -1,0 +1,84 @@
+{
+  "theme": "dark",
+  "geometry": "1440x837+-118+26",
+  "tabs": [
+    {
+      "tab_id": "tab_1776534802501",
+      "config": {
+        "name": "Gateway",
+        "project_type": "spring-boot",
+        "project_path": "C:/Users/932836/dev-env/repositories-temp-working-area/bag-globe-cloud/bag-globe-backend",
+        "main_class": "com.thy.gops.bagmonitor.BagMonitor",
+        "vm_options": "\t-Dthy.appdir=C:\\Users\\932836\\dev-env\\repositories\\bag_globe_app \t-Dapp.folder=bagglobe-gateway \t-Djasypt.encryptor.password=MySecretKey",
+        "program_args": "",
+        "spring_profile": "",
+        "override_port": false,
+        "server_port": "8080",
+        "console_logging": true,
+        "debug_enabled": false,
+        "debug_port": "5005",
+        "skip_jacoco": true,
+        "maven_path": "C:/Users/932836/dev-env/tools/apache-maven-3.9.11/",
+        "maven_profiles": "",
+        "maven_extra_args": "",
+        "java_path": "C:/Program Files/Java/jdk1.8.0_291",
+        "node_path": "npm",
+        "npm_script": "start",
+        "log_font_size": 14,
+        "sash_ratio": 0.562
+      }
+    },
+    {
+      "tab_id": "tab_1776535652908",
+      "config": {
+        "name": "Rest",
+        "project_type": "spring-boot",
+        "project_path": "C:/Users/932836/dev-env/repositories-temp-working-area/baggage-bus-rest-cloud",
+        "main_class": "com.thy.baggage.BaggageBusRestApp",
+        "vm_options": "-Dthy.appdir=C:\\Users\\932836\\dev-env\\repositories-temp-working-area\\bag_globe_app -Dapp.folder=bagglobe -Djasypt.encryptor.password=MySecretKey -Djps.track.ap.dependencies=false",
+        "program_args": "",
+        "spring_profile": "",
+        "override_port": false,
+        "server_port": "8080",
+        "console_logging": false,
+        "debug_enabled": false,
+        "debug_port": "5005",
+        "skip_jacoco": true,
+        "maven_path": "C:/Users/932836/dev-env/tools/apache-maven-3.9.11",
+        "maven_profiles": "",
+        "maven_extra_args": "",
+        "java_path": "C:/Program Files/Java/jdk1.8.0_291",
+        "node_path": "npm",
+        "npm_script": "start",
+        "log_font_size": 12,
+        "sash_ratio": 0.574
+      }
+    },
+    {
+      "tab_id": "tab_1776535908478",
+      "config": {
+        "name": "WEB",
+        "project_type": "npm",
+        "project_path": "C:/Users/932836/dev-env/repositories/bag-globe-cloud/bag-globe-web/webapp",
+        "main_class": "",
+        "vm_options": "",
+        "program_args": "",
+        "spring_profile": "",
+        "override_port": false,
+        "server_port": "8080",
+        "console_logging": true,
+        "debug_enabled": false,
+        "debug_port": "5005",
+        "skip_jacoco": true,
+        "maven_path": "mvn",
+        "maven_profiles": "",
+        "maven_extra_args": "",
+        "java_path": "java",
+        "node_path": "",
+        "npm_script": "dev",
+        "log_font_size": 12,
+        "sash_ratio": 0.66
+      }
+    }
+  ]
+}
