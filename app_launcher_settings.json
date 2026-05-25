@@ -1,6 +1,6 @@
 {
   "theme": "dark",
-  "geometry": "1440x837+-118+26",
+  "geometry": "1920x1017+-89+67",
   "tabs": [
     {
       "tab_id": "tab_1776534802501",
@@ -14,7 +14,8 @@
         "spring_profile": "",
         "override_port": false,
         "server_port": "8080",
-        "console_logging": true,
+        "console_logging": false,
+        "log_max_lines": "50",
         "debug_enabled": false,
         "debug_port": "5005",
         "skip_jacoco": true,
@@ -25,7 +26,7 @@
         "node_path": "npm",
         "npm_script": "start",
         "log_font_size": 14,
-        "sash_ratio": 0.562
+        "sash_ratio": 0.621
       }
     },
     {
@@ -41,6 +42,7 @@
         "override_port": false,
         "server_port": "8080",
         "console_logging": false,
+        "log_max_lines": "50",
         "debug_enabled": false,
         "debug_port": "5005",
         "skip_jacoco": true,
@@ -50,8 +52,8 @@
         "java_path": "C:/Program Files/Java/jdk1.8.0_291",
         "node_path": "npm",
         "npm_script": "start",
-        "log_font_size": 12,
-        "sash_ratio": 0.574
+        "log_font_size": 15,
+        "sash_ratio": 0.582
       }
     },
     {
@@ -59,14 +61,15 @@
       "config": {
         "name": "WEB",
         "project_type": "npm",
-        "project_path": "C:/Users/932836/dev-env/repositories/bag-globe-cloud/bag-globe-web/webapp",
+        "project_path": "C:/Users/932836/dev-env/repositories-temp-working-area/bag-globe-cloud/bag-globe-web/webapp",
         "main_class": "",
         "vm_options": "",
         "program_args": "",
         "spring_profile": "",
         "override_port": false,
         "server_port": "8080",
-        "console_logging": true,
+        "console_logging": false,
+        "log_max_lines": "50",
         "debug_enabled": false,
         "debug_port": "5005",
         "skip_jacoco": true,
@@ -76,8 +79,8 @@
         "java_path": "java",
         "node_path": "",
         "npm_script": "dev",
-        "log_font_size": 12,
-        "sash_ratio": 0.66
+        "log_font_size": 15,
+        "sash_ratio": 0.661
       }
     }
   ]

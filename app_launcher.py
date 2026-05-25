@@ -155,6 +155,7 @@ class ProjectTab:
 
         # Set initial sash from saved ratio (delayed to ensure widget is mapped)
         self._sash_retries = 0
+        self._sash_set = False
         self.frame.after(200, self._set_initial_sash)
 
         self._poll_output()
@@ -165,6 +166,7 @@ class ProjectTab:
         if total_w > 100:
             pos = int(total_w * self._saved_sash_ratio)
             self.paned.sash_place(0, pos, 0)
+            self._sash_set = True
         elif self._sash_retries < 10:
             self._sash_retries += 1
             self.frame.after(200, self._set_initial_sash)
@@ -521,6 +523,36 @@ class ProjectTab:
         found = shutil.which("java")
         return found if found else "java"
 
+    def _get_java_major_version(self, java_cmd):
+        """Returns the major Java version (e.g. 8, 11, 17, 21). Falls back to 8 on error."""
+        try:
+            startupinfo = None
+            if sys.platform == "win32":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            result = subprocess.run(
+                [java_cmd, "-version"],
+                capture_output=True, text=True,
+                startupinfo=startupinfo, timeout=5
+            )
+            output = result.stderr or result.stdout
+            # Output examples:
+            #   java version "1.8.0_291"   -> Java 8
+            #   openjdk version "11.0.2"   -> Java 11
+            #   openjdk version "17.0.1"   -> Java 17
+            import re
+            m = re.search(r'"(\d+)[\._]', output)
+            if m:
+                major = int(m.group(1))
+                # "1.8" style -> major is 1, real version is 8
+                if major == 1:
+                    m2 = re.search(r'"1\.(\d+)', output)
+                    return int(m2.group(1)) if m2 else 8
+                return major
+        except Exception:
+            pass
+        return 8  # safe fallback
+
     def _get_maven_cmd(self):
         mvn_path = self.setting_vars["maven_path"].get().strip()
         if mvn_path and os.path.isdir(mvn_path):
@@ -727,7 +759,14 @@ class ProjectTab:
         if vm_options:
             jvm_args.extend(vm_options.split())
         if debug_enabled and debug_port:
-            jvm_args.append(f"-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:{debug_port}")
+            # Java 8 uses address=5005, Java 9+ uses address=*:5005
+            java_cmd = self._get_java_cmd()
+            java_major = self._get_java_major_version(java_cmd)
+            if java_major >= 9:
+                debug_address = f"*:{debug_port}"
+            else:
+                debug_address = debug_port
+            jvm_args.append(f"-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address={debug_address}")
 
         # Console logging override
         console_logging = self.setting_vars["console_logging"].get()
@@ -893,6 +932,26 @@ class AppLauncher(ctk.CTk):
                 font=ctk.CTkFont(size=14, weight="bold"),
                 height=36
             )
+        except Exception:
+            pass
+
+        # When a tab is selected, restore its sash if not yet set
+        try:
+            self.tabview._notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+        except Exception:
+            pass
+
+    def _on_tab_changed(self, event=None):
+        """Restore sash for newly selected tab if it hasn't been set yet."""
+        try:
+            current_name = self.tabview.get()
+            for tab_data in self.tabs.values():
+                if tab_data["tab_name"] == current_name:
+                    proj = tab_data["project"]
+                    if not proj._sash_set:
+                        proj._sash_retries = 0
+                        proj.frame.after(100, proj._set_initial_sash)
+                    break
         except Exception:
             pass
 
