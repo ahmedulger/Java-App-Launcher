@@ -707,23 +707,41 @@ class ProjectTab:
             return None
         return self.app.get_datasource_by_label(var.get(), category)
 
-    def _build_datasource_run_args(self):
+    def _build_datasource_jvm_args(self):
         mappings = [
-            ("jdbc_url", "url"),
+            ("jdbc_url", "jdbc-url"),
             ("username", "username"),
             ("password", "password"),
             ("driver_class_name", "driver-class-name"),
         ]
         args = []
-        for category, prefix in (("primary", "database"), ("readonly", "database.readOnly")):
+        for category, prefix in (
+            ("primary", "spring.datasource.primary"),
+            ("readonly", "spring.datasource.readOnly"),
+        ):
             datasource = self._get_selected_datasource(category)
             if not datasource:
                 continue
             for source_key, property_name in mappings:
                 value = (datasource.get(source_key) or "").strip()
                 if value:
-                    args.append(f"--{prefix}.{property_name}={value}")
+                    args.append(f"-D{prefix}.{property_name}={value}")
         return args
+
+    def _command_for_log(self, cmd_parts):
+        command = " ".join(cmd_parts)
+        for token in (
+            "-Dspring.datasource.primary.password=",
+            "-Dspring.datasource.readOnly.password=",
+        ):
+            start = command.find(token)
+            if start < 0:
+                continue
+            end = command.find(" ", start)
+            if end < 0:
+                end = len(command)
+            command = f"{command[:start]}{token}***{command[end:]}"
+        return command
 
     def _log(self, text):
         self.output_queue.put(text)
@@ -899,6 +917,11 @@ class ProjectTab:
             jvm_args.append(f"-Dlogging.config=file:{config_path}")
             jvm_args.append(f"-Dlog4j.configurationFile=file:{config_path}")
 
+        # Resolve placeholders such as ${database.url} from JVM system properties.
+        datasource_jvm_args = self._build_datasource_jvm_args()
+        if datasource_jvm_args:
+            jvm_args.extend(datasource_jvm_args)
+
         if main_class:
             cmd_parts.append(f"-Dspring-boot.run.mainClass={main_class}")
         if spring_profile:
@@ -908,9 +931,6 @@ class ProjectTab:
         run_args = []
         if override_port and server_port:
             run_args.append(f"--server.port={server_port}")
-        datasource_args = self._build_datasource_run_args()
-        if datasource_args:
-            run_args.extend(datasource_args)
         if program_args:
             run_args.extend(program_args.split())
         if run_args:
@@ -924,13 +944,15 @@ class ProjectTab:
             cmd_parts.extend(profiles.split())
 
         self._log(f"[RUN] Starting Spring Boot application...\n")
-        self._log(f"[RUN] Command: {' '.join(cmd_parts)}\n")
+        self._log(f"[RUN] Command: {self._command_for_log(cmd_parts)}\n")
         self._log(f"[RUN] Directory: {cwd}\n")
         for category in ("primary", "readonly"):
             datasource = self._get_selected_datasource(category)
             if datasource:
                 environment = _normalize_datasource_environment(datasource.get("environment"))
                 self._log(f"[RUN] {category.title()} datasource: {datasource.get('name', '')} ({environment})\n")
+        if datasource_jvm_args:
+            self._log("[RUN] Datasource properties injected as JVM system properties.\n")
         if debug_enabled:
             self._log(f"[RUN] Debug port: {debug_port} (attach IntelliJ remote debugger to this port)\n")
         self._update_status("running")
@@ -1285,7 +1307,7 @@ class AppLauncher(ctk.CTk):
 
         help_label = ctk.CTkLabel(
             detail_frame,
-            text="Category maps to Spring args. Environment only controls the datasource color.",
+            text="Primary -> spring.datasource.primary.*, readonly -> spring.datasource.readOnly.*. Environment only controls color.",
             anchor="w",
             text_color=("gray35", "gray70"),
             font=ctk.CTkFont(size=11),
