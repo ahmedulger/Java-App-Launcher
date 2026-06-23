@@ -28,31 +28,32 @@ DEFAULT_MAVEN_PATH = "mvn"
 DEFAULT_JAVA_PATH = "java"
 DEFAULT_NODE_PATH = "npm"
 CONSOLE_LOG4J2_CONFIG = os.path.join(_BUNDLE_DIR, "log4j2-console.xml")
-DATASOURCE_TYPE_COLORS = {
-    "primary": "#27ae60",
-    "readonly": "#2980b9",
-    "read-only": "#2980b9",
-    "read_only": "#2980b9",
-    "test": "#8e44ad",
+DATASOURCE_ENVIRONMENT_COLORS = {
+    "local": "#27ae60",
+    "dev": "#e67e22",
 }
-DATASOURCE_TYPE_OPTIONS = ["primary", "readonly", "test"]
+DATASOURCE_CATEGORY_OPTIONS = ["primary", "readonly"]
+DATASOURCE_ENVIRONMENT_OPTIONS = ["local", "dev"]
 
 
 def _new_datasource_id():
     return f"ds_{int(time.time()*1000)}"
 
 
-def _normalize_datasource_type(value):
+def _normalize_datasource_category(value):
     value = (value or "primary").strip().lower()
     if value in ("read-only", "read_only", "readonly"):
         return "readonly"
-    if value == "test":
-        return "test"
     return "primary"
 
 
-def _datasource_color(value):
-    return DATASOURCE_TYPE_COLORS.get(_normalize_datasource_type(value), "#7f8c8d")
+def _normalize_datasource_environment(value):
+    value = (value or "local").strip().lower()
+    return value if value in DATASOURCE_ENVIRONMENT_OPTIONS else "local"
+
+
+def _datasource_color(environment):
+    return DATASOURCE_ENVIRONMENT_COLORS.get(_normalize_datasource_environment(environment), "#7f8c8d")
 
 
 class ProcessManager:
@@ -228,7 +229,8 @@ class ProjectTab:
             "skip_jacoco": True,
             "npm_script": "start",
             "spring_profile": "",
-            "datasource_id": "",
+            "primary_datasource_id": "",
+            "readonly_datasource_id": "",
             "override_port": False,
             "server_port": "",
         }
@@ -389,7 +391,8 @@ class ProjectTab:
         row = self._add_entry("program_args", "Program Args", row, self.config["program_args"])
         row = self._add_entry("spring_profile", "Spring Profile", row, self.config["spring_profile"],
                               placeholder="dev,local")
-        row = self._add_datasource_select(row)
+        row = self._add_datasource_select("primary", row)
+        row = self._add_datasource_select("readonly", row)
         row = self._add_checkbox("override_port", "Override Server Port", row,
                                  self.config.get("override_port", False))
         row = self._add_entry("server_port", "Server Port", row, self.config["server_port"],
@@ -509,8 +512,10 @@ class ProjectTab:
         self.setting_vars[key] = var
         return row + 1
 
-    def _add_datasource_select(self, row):
-        lbl = ctk.CTkLabel(self.settings_scroll, text="Datasource", anchor="w",
+    def _add_datasource_select(self, category, row):
+        key = f"{category}_datasource_id"
+        label = "Primary Datasource" if category == "primary" else "Readonly Datasource"
+        lbl = ctk.CTkLabel(self.settings_scroll, text=label, anchor="w",
                            font=ctk.CTkFont(size=12))
         lbl.grid(row=row, column=0, sticky="w", padx=(12, 5), pady=3)
 
@@ -518,46 +523,58 @@ class ProjectTab:
         inner.grid(row=row, column=1, columnspan=2, sticky="ew", padx=(5, 8), pady=3)
         inner.grid_columnconfigure(0, weight=1)
 
-        datasource_id = self.config.get("datasource_id", "")
-        default_label = self.app.get_datasource_label(datasource_id)
-        values = self.app.get_datasource_labels()
+        datasource_id = self.config.get(key, self.config.get("datasource_id", ""))
+        datasource = self.app.get_datasource_by_id(datasource_id)
+        if datasource and _normalize_datasource_category(datasource.get("category", datasource.get("type"))) != category:
+            datasource_id = ""
+        default_label = self.app.get_datasource_label(datasource_id, category)
+        values = self.app.get_datasource_labels(category)
         var = ctk.StringVar(value=default_label)
         menu = ctk.CTkOptionMenu(inner, variable=var, values=values,
                                  corner_radius=6, height=30,
-                                 command=lambda _: self._on_datasource_changed())
+                                 command=lambda _, c=category: self._on_datasource_changed(c))
         menu.grid(row=0, column=0, sticky="ew", padx=(0, 5))
 
-        self.datasource_badge = ctk.CTkLabel(inner, text="", width=76, height=24,
-                                             corner_radius=12, fg_color="gray45",
-                                             text_color="white",
-                                             font=ctk.CTkFont(size=11, weight="bold"))
-        self.datasource_badge.grid(row=0, column=1, sticky="e")
+        badge = ctk.CTkLabel(inner, text="", width=76, height=24,
+                             corner_radius=12, fg_color="gray45",
+                             text_color="white",
+                             font=ctk.CTkFont(size=11, weight="bold"))
+        badge.grid(row=0, column=1, sticky="e")
 
-        self.setting_vars["datasource_id"] = var
-        self.datasource_menu = menu
-        self._on_datasource_changed()
+        self.setting_vars[key] = var
+        if not hasattr(self, "datasource_menus"):
+            self.datasource_menus = {}
+            self.datasource_badges = {}
+        self.datasource_menus[category] = menu
+        self.datasource_badges[category] = badge
+        self._on_datasource_changed(category)
         return row + 1
 
-    def _on_datasource_changed(self):
-        datasource = self.app.get_datasource_by_label(self.setting_vars["datasource_id"].get())
+    def _on_datasource_changed(self, category):
+        datasource = self.app.get_datasource_by_label(
+            self.setting_vars[f"{category}_datasource_id"].get(), category
+        )
+        badge = self.datasource_badges[category]
         if datasource:
-            ds_type = _normalize_datasource_type(datasource.get("type"))
-            self.datasource_badge.configure(text=ds_type.upper(), fg_color=_datasource_color(ds_type))
+            environment = _normalize_datasource_environment(datasource.get("environment"))
+            badge.configure(text=environment.upper(), fg_color=_datasource_color(environment))
         else:
-            self.datasource_badge.configure(text="NONE", fg_color="gray45")
+            badge.configure(text="NONE", fg_color="gray45")
 
     def refresh_datasource_options(self):
-        if not hasattr(self, "datasource_menu"):
+        if not hasattr(self, "datasource_menus"):
             return
-        current = self.setting_vars["datasource_id"].get()
-        current_ds = self.app.get_datasource_by_label(current)
-        values = self.app.get_datasource_labels()
-        self.datasource_menu.configure(values=values)
-        if current_ds:
-            self.setting_vars["datasource_id"].set(self.app.get_datasource_label(current_ds.get("id")))
-        elif current not in values:
-            self.setting_vars["datasource_id"].set(values[0])
-        self._on_datasource_changed()
+        for category, menu in self.datasource_menus.items():
+            key = f"{category}_datasource_id"
+            current = self.setting_vars[key].get()
+            current_ds = self.app.get_datasource_by_label(current, category)
+            values = self.app.get_datasource_labels(category)
+            menu.configure(values=values)
+            if current_ds:
+                self.setting_vars[key].set(self.app.get_datasource_label(current_ds.get("id"), category))
+            elif current not in values:
+                self.setting_vars[key].set(values[0])
+            self._on_datasource_changed(category)
 
     def _add_checkbox(self, key, label, row, default=False):
         var = ctk.BooleanVar(value=default)
@@ -585,8 +602,9 @@ class ProjectTab:
     def get_config(self):
         cfg = {}
         for key, var in self.setting_vars.items():
-            if key == "datasource_id":
-                datasource = self.app.get_datasource_by_label(var.get())
+            if key in ("primary_datasource_id", "readonly_datasource_id"):
+                category = key.removesuffix("_datasource_id")
+                datasource = self.app.get_datasource_by_label(var.get(), category)
                 cfg[key] = datasource.get("id", "") if datasource else ""
             else:
                 cfg[key] = var.get()
@@ -683,25 +701,13 @@ class ProjectTab:
                 return found
         return "npm"
 
-    def _get_selected_datasource(self):
-        var = self.setting_vars.get("datasource_id")
+    def _get_selected_datasource(self, category):
+        var = self.setting_vars.get(f"{category}_datasource_id")
         if not var:
             return None
-        return self.app.get_datasource_by_label(var.get())
+        return self.app.get_datasource_by_label(var.get(), category)
 
     def _build_datasource_run_args(self):
-        datasource = self._get_selected_datasource()
-        if not datasource:
-            return []
-
-        ds_type = _normalize_datasource_type(datasource.get("type"))
-        if ds_type == "readonly":
-            prefix = "database.readOnly"
-        elif ds_type == "test":
-            prefix = "database.test"
-        else:
-            prefix = "database"
-
         mappings = [
             ("jdbc_url", "url"),
             ("username", "username"),
@@ -709,10 +715,14 @@ class ProjectTab:
             ("driver_class_name", "driver-class-name"),
         ]
         args = []
-        for source_key, property_name in mappings:
-            value = (datasource.get(source_key) or "").strip()
-            if value:
-                args.append(f"--{prefix}.{property_name}={value}")
+        for category, prefix in (("primary", "database"), ("readonly", "database.readOnly")):
+            datasource = self._get_selected_datasource(category)
+            if not datasource:
+                continue
+            for source_key, property_name in mappings:
+                value = (datasource.get(source_key) or "").strip()
+                if value:
+                    args.append(f"--{prefix}.{property_name}={value}")
         return args
 
     def _log(self, text):
@@ -916,10 +926,11 @@ class ProjectTab:
         self._log(f"[RUN] Starting Spring Boot application...\n")
         self._log(f"[RUN] Command: {' '.join(cmd_parts)}\n")
         self._log(f"[RUN] Directory: {cwd}\n")
-        datasource = self._get_selected_datasource()
-        if datasource:
-            ds_type = _normalize_datasource_type(datasource.get("type"))
-            self._log(f"[RUN] Datasource: {datasource.get('name', '')} ({ds_type})\n")
+        for category in ("primary", "readonly"):
+            datasource = self._get_selected_datasource(category)
+            if datasource:
+                environment = _normalize_datasource_environment(datasource.get("environment"))
+                self._log(f"[RUN] {category.title()} datasource: {datasource.get('name', '')} ({environment})\n")
         if debug_enabled:
             self._log(f"[RUN] Debug port: {debug_port} (attach IntelliJ remote debugger to this port)\n")
         self._update_status("running")
@@ -1176,7 +1187,8 @@ class AppLauncher(ctk.CTk):
             normalized.append({
                 "id": item.get("id") or _new_datasource_id(),
                 "name": item.get("name") or "Datasource",
-                "type": _normalize_datasource_type(item.get("type")),
+                "category": _normalize_datasource_category(item.get("category", item.get("type"))),
+                "environment": _normalize_datasource_environment(item.get("environment")),
                 "jdbc_url": item.get("jdbc_url") or item.get("url") or "",
                 "username": item.get("username") or "",
                 "password": item.get("password") or "",
@@ -1184,15 +1196,19 @@ class AppLauncher(ctk.CTk):
             })
         return normalized
 
-    def get_datasource_labels(self):
-        return ["None"] + [self.get_datasource_label(ds.get("id")) for ds in self.datasources]
+    def get_datasource_labels(self, category):
+        return ["None"] + [
+            self.get_datasource_label(ds.get("id"), category)
+            for ds in self.datasources
+            if ds.get("category") == category
+        ]
 
-    def get_datasource_label(self, datasource_id):
+    def get_datasource_label(self, datasource_id, category=None):
         datasource = self.get_datasource_by_id(datasource_id)
-        if not datasource:
+        if not datasource or (category and datasource.get("category") != category):
             return "None"
-        ds_type = _normalize_datasource_type(datasource.get("type"))
-        return f"{datasource.get('name', 'Datasource')} [{ds_type}]"
+        environment = _normalize_datasource_environment(datasource.get("environment"))
+        return f"{datasource.get('name', 'Datasource')} [{environment}]"
 
     def get_datasource_by_id(self, datasource_id):
         if not datasource_id:
@@ -1202,11 +1218,11 @@ class AppLauncher(ctk.CTk):
                 return datasource
         return None
 
-    def get_datasource_by_label(self, label):
+    def get_datasource_by_label(self, label, category=None):
         if not label or label == "None":
             return None
         for datasource in self.datasources:
-            if self.get_datasource_label(datasource.get("id")) == label:
+            if self.get_datasource_label(datasource.get("id"), category) == label:
                 return datasource
         return None
 
@@ -1237,7 +1253,8 @@ class AppLauncher(ctk.CTk):
         selected_id = ctk.StringVar(value=self.datasources[0]["id"] if self.datasources else "")
         form_vars = {
             "name": ctk.StringVar(),
-            "type": ctk.StringVar(value="primary"),
+            "category": ctk.StringVar(value="primary"),
+            "environment": ctk.StringVar(value="local"),
             "jdbc_url": ctk.StringVar(),
             "username": ctk.StringVar(),
             "password": ctk.StringVar(),
@@ -1246,7 +1263,8 @@ class AppLauncher(ctk.CTk):
 
         fields = [
             ("name", "Name", None),
-            ("type", "Type", DATASOURCE_TYPE_OPTIONS),
+            ("category", "Category", DATASOURCE_CATEGORY_OPTIONS),
+            ("environment", "Environment", DATASOURCE_ENVIRONMENT_OPTIONS),
             ("jdbc_url", "JDBC URL", None),
             ("username", "Username", None),
             ("password", "Password", None),
@@ -1267,7 +1285,7 @@ class AppLauncher(ctk.CTk):
 
         help_label = ctk.CTkLabel(
             detail_frame,
-            text="Spring args: primary -> database.*, readonly -> database.readOnly.*, test -> database.test.*",
+            text="Category maps to Spring args. Environment only controls the datasource color.",
             anchor="w",
             text_color=("gray35", "gray70"),
             font=ctk.CTkFont(size=11),
@@ -1276,7 +1294,11 @@ class AppLauncher(ctk.CTk):
 
         def load_selected():
             datasource = self.get_datasource_by_id(selected_id.get())
-            defaults = {"type": "primary", "driver_class_name": "org.postgresql.Driver"}
+            defaults = {
+                "category": "primary",
+                "environment": "local",
+                "driver_class_name": "org.postgresql.Driver",
+            }
             for key, var in form_vars.items():
                 var.set(datasource.get(key, "") if datasource else defaults.get(key, ""))
 
@@ -1284,14 +1306,15 @@ class AppLauncher(ctk.CTk):
             for child in list_scroll.winfo_children():
                 child.destroy()
             for datasource in self.datasources:
-                ds_type = _normalize_datasource_type(datasource.get("type"))
+                category = _normalize_datasource_category(datasource.get("category"))
+                environment = _normalize_datasource_environment(datasource.get("environment"))
                 button = ctk.CTkButton(
                     list_scroll,
-                    text=f"{datasource.get('name', 'Datasource')}  [{ds_type}]",
+                    text=f"{datasource.get('name', 'Datasource')}  [{category}] [{environment}]",
                     height=32,
                     corner_radius=6,
-                    fg_color=_datasource_color(ds_type),
-                    hover_color=_datasource_color(ds_type),
+                    fg_color=_datasource_color(environment),
+                    hover_color=_datasource_color(environment),
                     command=lambda ds_id=datasource.get("id"): (selected_id.set(ds_id), load_selected()),
                 )
                 button.pack(fill="x", padx=4, pady=3)
@@ -1300,7 +1323,8 @@ class AppLauncher(ctk.CTk):
             datasource = {
                 "id": _new_datasource_id(),
                 "name": "New Datasource",
-                "type": "primary",
+                "category": "primary",
+                "environment": "local",
                 "jdbc_url": "",
                 "username": "",
                 "password": "",
@@ -1318,7 +1342,8 @@ class AppLauncher(ctk.CTk):
                 add_datasource()
                 datasource = self.get_datasource_by_id(selected_id.get())
             datasource["name"] = form_vars["name"].get().strip() or "Datasource"
-            datasource["type"] = _normalize_datasource_type(form_vars["type"].get())
+            datasource["category"] = _normalize_datasource_category(form_vars["category"].get())
+            datasource["environment"] = _normalize_datasource_environment(form_vars["environment"].get())
             datasource["jdbc_url"] = form_vars["jdbc_url"].get().strip()
             datasource["username"] = form_vars["username"].get().strip()
             datasource["password"] = form_vars["password"].get()
