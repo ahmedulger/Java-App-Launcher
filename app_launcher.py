@@ -23,10 +23,37 @@ else:
     _BUNDLE_DIR = _BASE_DIR
 
 SETTINGS_FILE = os.path.join(_BASE_DIR, "app_launcher_settings.json")
+DATASOURCES_FILE = os.path.join(_BASE_DIR, "datasources.json")
 DEFAULT_MAVEN_PATH = "mvn"
 DEFAULT_JAVA_PATH = "java"
 DEFAULT_NODE_PATH = "npm"
 CONSOLE_LOG4J2_CONFIG = os.path.join(_BUNDLE_DIR, "log4j2-console.xml")
+DATASOURCE_ENVIRONMENT_COLORS = {
+    "local": "#27ae60",
+    "dev": "#e67e22",
+}
+DATASOURCE_CATEGORY_OPTIONS = ["primary", "readonly"]
+DATASOURCE_ENVIRONMENT_OPTIONS = ["local", "dev"]
+
+
+def _new_datasource_id():
+    return f"ds_{int(time.time()*1000)}"
+
+
+def _normalize_datasource_category(value):
+    value = (value or "primary").strip().lower()
+    if value in ("read-only", "read_only", "readonly"):
+        return "readonly"
+    return "primary"
+
+
+def _normalize_datasource_environment(value):
+    value = (value or "local").strip().lower()
+    return value if value in DATASOURCE_ENVIRONMENT_OPTIONS else "local"
+
+
+def _datasource_color(environment):
+    return DATASOURCE_ENVIRONMENT_COLORS.get(_normalize_datasource_environment(environment), "#7f8c8d")
 
 
 class ProcessManager:
@@ -202,6 +229,8 @@ class ProjectTab:
             "skip_jacoco": True,
             "npm_script": "start",
             "spring_profile": "",
+            "primary_datasource_id": "",
+            "readonly_datasource_id": "",
             "override_port": False,
             "server_port": "",
         }
@@ -362,6 +391,8 @@ class ProjectTab:
         row = self._add_entry("program_args", "Program Args", row, self.config["program_args"])
         row = self._add_entry("spring_profile", "Spring Profile", row, self.config["spring_profile"],
                               placeholder="dev,local")
+        row = self._add_datasource_select("primary", row)
+        row = self._add_datasource_select("readonly", row)
         row = self._add_checkbox("override_port", "Override Server Port", row,
                                  self.config.get("override_port", False))
         row = self._add_entry("server_port", "Server Port", row, self.config["server_port"],
@@ -481,6 +512,70 @@ class ProjectTab:
         self.setting_vars[key] = var
         return row + 1
 
+    def _add_datasource_select(self, category, row):
+        key = f"{category}_datasource_id"
+        label = "Primary Datasource" if category == "primary" else "Readonly Datasource"
+        lbl = ctk.CTkLabel(self.settings_scroll, text=label, anchor="w",
+                           font=ctk.CTkFont(size=12))
+        lbl.grid(row=row, column=0, sticky="w", padx=(12, 5), pady=3)
+
+        inner = ctk.CTkFrame(self.settings_scroll, fg_color="transparent")
+        inner.grid(row=row, column=1, columnspan=2, sticky="ew", padx=(5, 8), pady=3)
+        inner.grid_columnconfigure(0, weight=1)
+
+        datasource_id = self.config.get(key, self.config.get("datasource_id", ""))
+        datasource = self.app.get_datasource_by_id(datasource_id)
+        if datasource and _normalize_datasource_category(datasource.get("category", datasource.get("type"))) != category:
+            datasource_id = ""
+        default_label = self.app.get_datasource_label(datasource_id, category)
+        values = self.app.get_datasource_labels(category)
+        var = ctk.StringVar(value=default_label)
+        menu = ctk.CTkOptionMenu(inner, variable=var, values=values,
+                                 corner_radius=6, height=30,
+                                 command=lambda _, c=category: self._on_datasource_changed(c))
+        menu.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+
+        badge = ctk.CTkLabel(inner, text="", width=76, height=24,
+                             corner_radius=12, fg_color="gray45",
+                             text_color="white",
+                             font=ctk.CTkFont(size=11, weight="bold"))
+        badge.grid(row=0, column=1, sticky="e")
+
+        self.setting_vars[key] = var
+        if not hasattr(self, "datasource_menus"):
+            self.datasource_menus = {}
+            self.datasource_badges = {}
+        self.datasource_menus[category] = menu
+        self.datasource_badges[category] = badge
+        self._on_datasource_changed(category)
+        return row + 1
+
+    def _on_datasource_changed(self, category):
+        datasource = self.app.get_datasource_by_label(
+            self.setting_vars[f"{category}_datasource_id"].get(), category
+        )
+        badge = self.datasource_badges[category]
+        if datasource:
+            environment = _normalize_datasource_environment(datasource.get("environment"))
+            badge.configure(text=environment.upper(), fg_color=_datasource_color(environment))
+        else:
+            badge.configure(text="NONE", fg_color="gray45")
+
+    def refresh_datasource_options(self):
+        if not hasattr(self, "datasource_menus"):
+            return
+        for category, menu in self.datasource_menus.items():
+            key = f"{category}_datasource_id"
+            current = self.setting_vars[key].get()
+            current_ds = self.app.get_datasource_by_label(current, category)
+            values = self.app.get_datasource_labels(category)
+            menu.configure(values=values)
+            if current_ds:
+                self.setting_vars[key].set(self.app.get_datasource_label(current_ds.get("id"), category))
+            elif current not in values:
+                self.setting_vars[key].set(values[0])
+            self._on_datasource_changed(category)
+
     def _add_checkbox(self, key, label, row, default=False):
         var = ctk.BooleanVar(value=default)
         cb = ctk.CTkCheckBox(self.settings_scroll, text=label, variable=var,
@@ -507,7 +602,12 @@ class ProjectTab:
     def get_config(self):
         cfg = {}
         for key, var in self.setting_vars.items():
-            cfg[key] = var.get()
+            if key in ("primary_datasource_id", "readonly_datasource_id"):
+                category = key.removesuffix("_datasource_id")
+                datasource = self.app.get_datasource_by_label(var.get(), category)
+                cfg[key] = datasource.get("id", "") if datasource else ""
+            else:
+                cfg[key] = var.get()
         cfg["log_font_size"] = self._log_font_size
         cfg["sash_ratio"] = self._get_sash_ratio()
         return cfg
@@ -600,6 +700,48 @@ class ProjectTab:
             if found:
                 return found
         return "npm"
+
+    def _get_selected_datasource(self, category):
+        var = self.setting_vars.get(f"{category}_datasource_id")
+        if not var:
+            return None
+        return self.app.get_datasource_by_label(var.get(), category)
+
+    def _build_datasource_jvm_args(self):
+        mappings = [
+            ("jdbc_url", "jdbc-url"),
+            ("username", "username"),
+            ("password", "password"),
+            ("driver_class_name", "driver-class-name"),
+        ]
+        args = []
+        for category, prefix in (
+            ("primary", "spring.datasource.primary"),
+            ("readonly", "spring.datasource.read-only-database"),
+        ):
+            datasource = self._get_selected_datasource(category)
+            if not datasource:
+                continue
+            for source_key, property_name in mappings:
+                value = (datasource.get(source_key) or "").strip()
+                if value:
+                    args.append(f"-D{prefix}.{property_name}={value}")
+        return args
+
+    def _command_for_log(self, cmd_parts):
+        command = " ".join(cmd_parts)
+        for token in (
+            "-Dspring.datasource.primary.password=",
+            "-Dspring.datasource.read-only-database.password=",
+        ):
+            start = command.find(token)
+            if start < 0:
+                continue
+            end = command.find(" ", start)
+            if end < 0:
+                end = len(command)
+            command = f"{command[:start]}{token}***{command[end:]}"
+        return command
 
     def _log(self, text):
         self.output_queue.put(text)
@@ -775,6 +917,11 @@ class ProjectTab:
             jvm_args.append(f"-Dlogging.config=file:{config_path}")
             jvm_args.append(f"-Dlog4j.configurationFile=file:{config_path}")
 
+        # Resolve placeholders such as ${database.url} from JVM system properties.
+        datasource_jvm_args = self._build_datasource_jvm_args()
+        if datasource_jvm_args:
+            jvm_args.extend(datasource_jvm_args)
+
         if main_class:
             cmd_parts.append(f"-Dspring-boot.run.mainClass={main_class}")
         if spring_profile:
@@ -797,8 +944,15 @@ class ProjectTab:
             cmd_parts.extend(profiles.split())
 
         self._log(f"[RUN] Starting Spring Boot application...\n")
-        self._log(f"[RUN] Command: {' '.join(cmd_parts)}\n")
+        self._log(f"[RUN] Command: {self._command_for_log(cmd_parts)}\n")
         self._log(f"[RUN] Directory: {cwd}\n")
+        for category in ("primary", "readonly"):
+            datasource = self._get_selected_datasource(category)
+            if datasource:
+                environment = _normalize_datasource_environment(datasource.get("environment"))
+                self._log(f"[RUN] {category.title()} datasource: {datasource.get('name', '')} ({environment})\n")
+        if datasource_jvm_args:
+            self._log("[RUN] Datasource properties injected as JVM system properties.\n")
         if debug_enabled:
             self._log(f"[RUN] Debug port: {debug_port} (attach IntelliJ remote debugger to this port)\n")
         self._update_status("running")
@@ -845,12 +999,16 @@ class AppLauncher(ctk.CTk):
 
         self.tabs = {}  # tab_id -> ProjectTab
         self._current_theme = "dark"
+        self.datasources = []
 
         self._load_settings_and_build()
 
     def _load_settings_and_build(self):
         saved = self._load_settings_file()
         self._current_theme = saved.get("theme", "dark")
+        self.datasources = self._load_datasources_file()
+        if not self.datasources and saved.get("datasources"):
+            self.datasources = self._normalize_datasources(saved.get("datasources", []))
         ctk.set_appearance_mode(self._current_theme)
         ctk.set_default_color_theme("blue")
 
@@ -897,6 +1055,12 @@ class AppLauncher(ctk.CTk):
                                    font=ctk.CTkFont(size=12),
                                    command=self._rename_current_tab)
         btn_rename.pack(side="left", padx=4, pady=7)
+
+        btn_datasources = ctk.CTkButton(topbar, text="Datasources", width=120, height=32, corner_radius=6,
+                                        fg_color="#16a085", hover_color="#1abc9c",
+                                        font=ctk.CTkFont(size=12, weight="bold"),
+                                        command=self._open_datasource_manager)
+        btn_datasources.pack(side="left", padx=4, pady=7)
 
         # Right side of topbar
         self.theme_btn = ctk.CTkButton(topbar,
@@ -1033,6 +1197,221 @@ class AppLauncher(ctk.CTk):
             self.theme_btn.configure(text="🌙 Dark")
 
     # ========================
+    # DATASOURCES
+    # ========================
+    def _normalize_datasources(self, datasources):
+        normalized = []
+        if not isinstance(datasources, list):
+            return normalized
+        for item in datasources:
+            if not isinstance(item, dict):
+                continue
+            normalized.append({
+                "id": item.get("id") or _new_datasource_id(),
+                "name": item.get("name") or "Datasource",
+                "category": _normalize_datasource_category(item.get("category", item.get("type"))),
+                "environment": _normalize_datasource_environment(item.get("environment")),
+                "jdbc_url": item.get("jdbc_url") or item.get("url") or "",
+                "username": item.get("username") or "",
+                "password": item.get("password") or "",
+                "driver_class_name": item.get("driver_class_name") or item.get("driver-class-name") or "org.postgresql.Driver",
+            })
+        return normalized
+
+    def get_datasource_labels(self, category):
+        return ["None"] + [
+            self.get_datasource_label(ds.get("id"), category)
+            for ds in self.datasources
+            if ds.get("category") == category
+        ]
+
+    def get_datasource_label(self, datasource_id, category=None):
+        datasource = self.get_datasource_by_id(datasource_id)
+        if not datasource or (category and datasource.get("category") != category):
+            return "None"
+        environment = _normalize_datasource_environment(datasource.get("environment"))
+        return f"{datasource.get('name', 'Datasource')} [{environment}]"
+
+    def get_datasource_by_id(self, datasource_id):
+        if not datasource_id:
+            return None
+        for datasource in self.datasources:
+            if datasource.get("id") == datasource_id:
+                return datasource
+        return None
+
+    def get_datasource_by_label(self, label, category=None):
+        if not label or label == "None":
+            return None
+        for datasource in self.datasources:
+            if self.get_datasource_label(datasource.get("id"), category) == label:
+                return datasource
+        return None
+
+    def _refresh_datasource_menus(self):
+        for info in self.tabs.values():
+            info["project"].refresh_datasource_options()
+
+    def _open_datasource_manager(self):
+        window = ctk.CTkToplevel(self)
+        window.title("Datasources")
+        window.geometry("760x480")
+        window.transient(self)
+        window.grab_set()
+        window.grid_rowconfigure(0, weight=1)
+        window.grid_columnconfigure(1, weight=1)
+
+        list_frame = ctk.CTkFrame(window, corner_radius=8)
+        list_frame.grid(row=0, column=0, sticky="ns", padx=(10, 5), pady=10)
+        list_frame.grid_rowconfigure(0, weight=1)
+
+        detail_frame = ctk.CTkFrame(window, corner_radius=8)
+        detail_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 10), pady=10)
+        detail_frame.grid_columnconfigure(1, weight=1)
+
+        list_scroll = ctk.CTkScrollableFrame(list_frame, width=230, corner_radius=6)
+        list_scroll.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 4))
+
+        selected_id = ctk.StringVar(value=self.datasources[0]["id"] if self.datasources else "")
+        form_vars = {
+            "name": ctk.StringVar(),
+            "category": ctk.StringVar(value="primary"),
+            "environment": ctk.StringVar(value="local"),
+            "jdbc_url": ctk.StringVar(),
+            "username": ctk.StringVar(),
+            "password": ctk.StringVar(),
+            "driver_class_name": ctk.StringVar(value="org.postgresql.Driver"),
+        }
+
+        fields = [
+            ("name", "Name", None),
+            ("category", "Category", DATASOURCE_CATEGORY_OPTIONS),
+            ("environment", "Environment", DATASOURCE_ENVIRONMENT_OPTIONS),
+            ("jdbc_url", "JDBC URL", None),
+            ("username", "Username", None),
+            ("password", "Password", None),
+            ("driver_class_name", "Driver", None),
+        ]
+        for row, (key, label, values) in enumerate(fields):
+            ctk.CTkLabel(detail_frame, text=label, anchor="w").grid(
+                row=row, column=0, sticky="w", padx=(12, 6), pady=6
+            )
+            if values:
+                widget = ctk.CTkOptionMenu(detail_frame, variable=form_vars[key], values=values,
+                                           height=30, corner_radius=6)
+            else:
+                widget = ctk.CTkEntry(detail_frame, textvariable=form_vars[key],
+                                      show="*" if key == "password" else "",
+                                      height=30, corner_radius=6)
+            widget.grid(row=row, column=1, sticky="ew", padx=(6, 12), pady=6)
+
+        help_label = ctk.CTkLabel(
+            detail_frame,
+            text="Primary -> spring.datasource.primary.*, read-only-database -> spring.datasource.read-only-database.*. Environment only controls color.",
+            anchor="w",
+            text_color=("gray35", "gray70"),
+            font=ctk.CTkFont(size=11),
+        )
+        help_label.grid(row=len(fields), column=0, columnspan=2, sticky="ew", padx=12, pady=(4, 8))
+
+        def load_selected():
+            datasource = self.get_datasource_by_id(selected_id.get())
+            defaults = {
+                "category": "primary",
+                "environment": "local",
+                "driver_class_name": "org.postgresql.Driver",
+            }
+            for key, var in form_vars.items():
+                var.set(datasource.get(key, "") if datasource else defaults.get(key, ""))
+
+        def rebuild_list():
+            for child in list_scroll.winfo_children():
+                child.destroy()
+            for datasource in self.datasources:
+                category = _normalize_datasource_category(datasource.get("category"))
+                environment = _normalize_datasource_environment(datasource.get("environment"))
+                button = ctk.CTkButton(
+                    list_scroll,
+                    text=f"{datasource.get('name', 'Datasource')}  [{category}] [{environment}]",
+                    height=32,
+                    corner_radius=6,
+                    fg_color=_datasource_color(environment),
+                    hover_color=_datasource_color(environment),
+                    command=lambda ds_id=datasource.get("id"): (selected_id.set(ds_id), load_selected()),
+                )
+                button.pack(fill="x", padx=4, pady=3)
+
+        def add_datasource():
+            datasource = {
+                "id": _new_datasource_id(),
+                "name": "New Datasource",
+                "category": "primary",
+                "environment": "local",
+                "jdbc_url": "",
+                "username": "",
+                "password": "",
+                "driver_class_name": "org.postgresql.Driver",
+            }
+            self.datasources.append(datasource)
+            selected_id.set(datasource["id"])
+            rebuild_list()
+            load_selected()
+            self._refresh_datasource_menus()
+
+        def save_datasource():
+            datasource = self.get_datasource_by_id(selected_id.get())
+            if not datasource:
+                add_datasource()
+                datasource = self.get_datasource_by_id(selected_id.get())
+            datasource["name"] = form_vars["name"].get().strip() or "Datasource"
+            datasource["category"] = _normalize_datasource_category(form_vars["category"].get())
+            datasource["environment"] = _normalize_datasource_environment(form_vars["environment"].get())
+            datasource["jdbc_url"] = form_vars["jdbc_url"].get().strip()
+            datasource["username"] = form_vars["username"].get().strip()
+            datasource["password"] = form_vars["password"].get()
+            datasource["driver_class_name"] = form_vars["driver_class_name"].get().strip()
+            rebuild_list()
+            self._refresh_datasource_menus()
+            self._save_settings()
+
+        def delete_datasource():
+            datasource_id = selected_id.get()
+            if not datasource_id:
+                return
+            datasource = self.get_datasource_by_id(datasource_id)
+            if datasource and not messagebox.askyesno("Delete Datasource", f"Delete '{datasource.get('name')}'?"):
+                return
+            self.datasources = [ds for ds in self.datasources if ds.get("id") != datasource_id]
+            selected_id.set(self.datasources[0]["id"] if self.datasources else "")
+            rebuild_list()
+            load_selected()
+            self._refresh_datasource_menus()
+            self._save_settings()
+
+        actions = ctk.CTkFrame(list_frame, fg_color="transparent")
+        actions.grid(row=1, column=0, sticky="ew", padx=8, pady=(4, 8))
+        actions.grid_columnconfigure((0, 1), weight=1)
+        ctk.CTkButton(actions, text="Add", height=30, corner_radius=6,
+                      fg_color="#27ae60", hover_color="#2ecc71",
+                      command=add_datasource).grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        ctk.CTkButton(actions, text="Delete", height=30, corner_radius=6,
+                      fg_color="#c0392b", hover_color="#e74c3c",
+                      command=delete_datasource).grid(row=0, column=1, sticky="ew", padx=(3, 0))
+
+        bottom = ctk.CTkFrame(detail_frame, fg_color="transparent")
+        bottom.grid(row=len(fields) + 1, column=0, columnspan=2, sticky="ew", padx=12, pady=(8, 12))
+        bottom.grid_columnconfigure(0, weight=1)
+        ctk.CTkButton(bottom, text="Save", height=32, corner_radius=6,
+                      fg_color="#2980b9", hover_color="#3498db",
+                      command=save_datasource).grid(row=0, column=1, padx=(6, 0))
+        ctk.CTkButton(bottom, text="Close", height=32, corner_radius=6,
+                      fg_color=("gray65", "gray35"), hover_color=("gray55", "gray45"),
+                      command=window.destroy).grid(row=0, column=2, padx=(6, 0))
+
+        rebuild_list()
+        load_selected()
+
+    # ========================
     # PERSISTENCE
     # ========================
     def _collect_save_data(self):
@@ -1045,6 +1424,7 @@ class AppLauncher(ctk.CTk):
         return {
             "theme": self._current_theme,
             "geometry": self.geometry(),
+            "datasources": self.datasources,
             "tabs": tabs_data,
         }
 
@@ -1053,8 +1433,26 @@ class AppLauncher(ctk.CTk):
         try:
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
+            self._save_datasources_file()
         except Exception as e:
             print(f"Failed to save settings: {e}")
+
+    def _save_datasources_file(self):
+        try:
+            with open(DATASOURCES_FILE, "w", encoding="utf-8") as f:
+                json.dump({"datasources": self.datasources}, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"Failed to save datasources: {e}")
+
+    def _load_datasources_file(self):
+        if os.path.exists(DATASOURCES_FILE):
+            try:
+                with open(DATASOURCES_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return self._normalize_datasources(data.get("datasources", []))
+            except Exception:
+                pass
+        return []
 
     def _load_settings_file(self):
         if os.path.exists(SETTINGS_FILE):
@@ -1098,6 +1496,7 @@ class AppLauncher(ctk.CTk):
 
                 # Load new tabs
                 self._current_theme = data.get("theme", "dark")
+                self.datasources = self._normalize_datasources(data.get("datasources", []))
                 ctk.set_appearance_mode(self._current_theme)
                 self.theme_btn.configure(text="🌙 Dark" if self._current_theme == "dark" else "☀ Light")
 
