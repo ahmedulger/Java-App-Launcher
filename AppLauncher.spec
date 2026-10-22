@@ -1,12 +1,18 @@
 # -*- mode: python ; coding: utf-8 -*-
+import sys
+from pathlib import Path
 
+sys.path.insert(0, SPECPATH)
+from launcher_icon import write_run_icon
+
+write_run_icon(Path(SPECPATH))
 
 a = Analysis(
     ['app_launcher.py'],
     pathex=[],
     binaries=[],
     datas=[('log4j2-console.xml', '.'), ('app_icon.ico', '.')],
-    hiddenimports=[],
+    hiddenimports=['yaml', 'javaproperties'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

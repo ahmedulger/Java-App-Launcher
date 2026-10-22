@@ -11,6 +11,13 @@ import shutil
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from datetime import datetime
+from launcher_icon import create_run_icon
+from project_discovery import discover_toolchains, find_spring_boot_classes
+from launch_config import (
+    SECRET, config_environments, config_files, config_directory, load_config,
+    datasource_properties, prepare_backend, parse_environment, split_arguments,
+    join_arguments,
+)
 
 # --- Constants ---
 APP_TITLE = "App Launcher"
@@ -27,6 +34,8 @@ DATASOURCES_FILE = os.path.join(_BASE_DIR, "datasources.json")
 DEFAULT_MAVEN_PATH = "mvn"
 DEFAULT_JAVA_PATH = "java"
 DEFAULT_NODE_PATH = "npm"
+SYSTEM_TOOLCHAIN = "System PATH"
+SELECTED_CONFIG_FOLDER = "Selected folder"
 CONSOLE_LOG4J2_CONFIG = os.path.join(_BUNDLE_DIR, "log4j2-console.xml")
 DATASOURCE_ENVIRONMENT_COLORS = {
     "local": "#27ae60",
@@ -158,7 +167,18 @@ class ProjectTab:
             on_exit=self._on_process_exit,
         )
         self.output_queue = queue.Queue()
-        self.config = config or self._default_config()
+        self.config = {**self._default_config(), **(config or {})}
+        self.property_overrides = dict(self.config.get("property_overrides", {}))
+        self.loaded_config = None
+        self._config_refresh_job = None
+        self._main_class_job = None
+        self._main_scan_generation = 0
+        self._main_class_project = self.config["project_path"].strip()
+        self._main_class_results = queue.Queue()
+        self.toolchain_menus = {}
+        self._editing_property = False
+        self._selected_property = None
+        self.section_headers = []
         self._log_font_size = int(self.config.get("log_font_size", 12))
         self._saved_sash_ratio = self.config.get("sash_ratio", 0.5)
 
@@ -177,13 +197,13 @@ class ProjectTab:
         self._build_settings_panel()
 
         # Add panels to paned window
-        self.paned.add(self.log_outer_frame, stretch="always")
-        self.paned.add(self.settings_outer_frame, stretch="always")
+        self.paned.add(self.log_outer_frame, stretch="always", minsize=320)
+        self.paned.add(self.settings_outer_frame, stretch="always", minsize=430)
 
         # Set initial sash from saved ratio (delayed to ensure widget is mapped)
         self._sash_retries = 0
         self._sash_set = False
-        self.frame.after(200, self._set_initial_sash)
+        self._sash_job = self.frame.after(200, self._set_initial_sash)
 
         self._poll_output()
 
@@ -196,7 +216,7 @@ class ProjectTab:
             self._sash_set = True
         elif self._sash_retries < 10:
             self._sash_retries += 1
-            self.frame.after(200, self._set_initial_sash)
+            self._sash_job = self.frame.after(200, self._set_initial_sash)
 
     def _get_sash_ratio(self):
         """Get current sash position as a ratio 0-1."""
@@ -233,6 +253,14 @@ class ProjectTab:
             "readonly_datasource_id": "",
             "override_port": False,
             "server_port": "",
+            "config_repo_path": "",
+            "config_environment": "",
+            "config_filename": "",
+            "listen_port": "",
+            "metric_port": "",
+            "app_directory": "",
+            "environment_variables": "",
+            "property_overrides": {},
         }
 
     # ========================
@@ -240,7 +268,7 @@ class ProjectTab:
     # ========================
     def _build_log_panel(self):
         self.log_outer_frame = tk.Frame(self.paned, bg="#2b2b2b")
-        log_frame = ctk.CTkFrame(self.log_outer_frame, corner_radius=10)
+        log_frame = ctk.CTkFrame(self.log_outer_frame, corner_radius=6)
         log_frame.pack(fill="both", expand=True, padx=(4, 2), pady=4)
         log_frame.grid_rowconfigure(1, weight=1)
         log_frame.grid_columnconfigure(0, weight=1)
@@ -248,6 +276,10 @@ class ProjectTab:
         # Toolbar
         toolbar = ctk.CTkFrame(log_frame, height=44, corner_radius=8, fg_color=("gray86", "gray20"))
         toolbar.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 3))
+        actions = ctk.CTkFrame(log_frame, fg_color="transparent")
+        actions.grid(row=1, column=0, sticky="ew", padx=6, pady=3)
+        log_frame.grid_rowconfigure(1, weight=0)
+        log_frame.grid_rowconfigure(2, weight=1)
 
         self.status_label = ctk.CTkLabel(toolbar, text="● STOPPED", text_color="gray",
                                          font=ctk.CTkFont(size=13, weight="bold"))
@@ -270,24 +302,25 @@ class ProjectTab:
                                       command=self._log_font_increase)
         btn_font_plus.pack(side="left", padx=(1, 4))
 
-        btn_clear = ctk.CTkButton(toolbar, text="Clear", width=70, height=30, corner_radius=6,
+        btn_clear = ctk.CTkButton(actions, text="Clear", width=70, height=30, corner_radius=6,
                                   fg_color=("gray70", "gray35"), hover_color=("gray60", "gray45"),
                                   command=self._clear_logs)
         btn_clear.pack(side="right", padx=3)
 
-        btn_stop = ctk.CTkButton(toolbar, text="⏹ Stop", width=80, height=30, corner_radius=6,
+        btn_stop = ctk.CTkButton(actions, text="⏹ Stop", width=80, height=30, corner_radius=6,
                                  fg_color="#c0392b", hover_color="#e74c3c", command=self.stop_process)
         btn_stop.pack(side="right", padx=3)
 
-        btn_run = ctk.CTkButton(toolbar, text="▶ Run", width=80, height=30, corner_radius=6,
-                                fg_color="#27ae60", hover_color="#2ecc71", command=self.run_app)
+        btn_run = ctk.CTkButton(actions, text="Run", image=self.app.run_icon, width=80, height=30, corner_radius=6,
+                    fg_color=("#deeee4", "#253c2f"), hover_color=("#c7e3d2", "#31543f"),
+                    text_color=("#185d37", "#b7f0cb"), command=self.run_app)
         btn_run.pack(side="right", padx=3)
 
         # Log text
         self.log_text = ctk.CTkTextbox(log_frame, wrap="word", corner_radius=8,
                                        font=ctk.CTkFont(family="Consolas", size=self._log_font_size),
                                        state="disabled")
-        self.log_text.grid(row=1, column=0, sticky="nsew", padx=6, pady=(3, 6))
+        self.log_text.grid(row=2, column=0, sticky="nsew", padx=6, pady=(3, 6))
 
         # Configure color tags
         self._setup_log_tags()
@@ -342,27 +375,76 @@ class ProjectTab:
     # ========================
     def _build_settings_panel(self):
         self.settings_outer_frame = tk.Frame(self.paned, bg="#2b2b2b")
-        settings_outer = ctk.CTkFrame(self.settings_outer_frame, corner_radius=10)
+        settings_outer = ctk.CTkFrame(self.settings_outer_frame, corner_radius=6)
         settings_outer.pack(fill="both", expand=True, padx=(2, 4), pady=4)
-        settings_outer.grid_rowconfigure(0, weight=1)
+        settings_outer.grid_rowconfigure(1, weight=1)
         settings_outer.grid_columnconfigure(0, weight=1)
-
-        self.settings_scroll = ctk.CTkScrollableFrame(settings_outer, corner_radius=8)
+        self.settings_scroll = ctk.CTkFrame(settings_outer, fg_color="transparent")
         self.settings_scroll.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
         self.settings_scroll.grid_columnconfigure(1, weight=1)
-
         self.setting_vars = {}
         row = 0
-
-        # --- Group: Project ---
         row = self._add_group_header("Project", row)
         row = self._add_entry("name", "Tab Name", row, self.config["name"])
         row = self._add_option_menu("project_type", "Project Type", row,
                                     ["spring-boot", "npm"], self.config["project_type"])
         row = self._add_path_entry("project_path", "Project Path", row, self.config["project_path"], mode="folder")
 
-        # --- Group: Maven Operations ---
-        row = self._add_group_header("Maven Operations", row)
+        self.settings_views = ctk.CTkTabview(settings_outer, corner_radius=6)
+        self.settings_views.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 4))
+        self.settings_pages = {}
+        for name in ("Backend", "Overrides", "Runtime", "Maven", "Web"):
+            page = self.settings_views.add(name)
+            page.grid_rowconfigure(0, weight=1)
+            page.grid_columnconfigure(0, weight=1)
+            scroll = ctk.CTkScrollableFrame(page, corner_radius=0, fg_color="transparent")
+            scroll.grid(row=0, column=0, sticky="nsew")
+            scroll.grid_columnconfigure(1, weight=1)
+            self.settings_pages[name] = scroll
+
+        self.settings_scroll = self.settings_pages["Backend"]
+        row = self._add_group_header("Configuration", 0)
+        row = self._add_path_entry("config_repo_path", "Config Repo", row, self.config["config_repo_path"])
+        row = self._add_option_menu("config_environment", "Environment", row,
+                                   [self.config["config_environment"] or SELECTED_CONFIG_FOLDER],
+                                   self.config["config_environment"] or SELECTED_CONFIG_FOLDER)
+        self.environment_menu = self.settings_scroll.grid_slaves(row=row - 1, column=1)[0]
+        self.environment_menu.configure(command=lambda _: self._reload_config_files())
+        row = self._add_option_menu("config_filename", "Config File", row,
+                                   [self.config["config_filename"] or "application.yml"],
+                                   self.config["config_filename"] or "application.yml")
+        self.config_file_menu = self.settings_scroll.grid_slaves(row=row - 1, column=1)[0]
+        self.config_file_menu.configure(command=lambda _: self._load_config_fields())
+        row = self._add_path_entry("app_directory", "thy.appdir *", row, self.config["app_directory"])
+        self.config_status = ctk.CTkLabel(self.settings_scroll, text="", anchor="w",
+                                         font=ctk.CTkFont(size=11), wraplength=340)
+        self.config_status.grid(row=row, column=0, columnspan=3, sticky="ew", padx=12, pady=6)
+        row += 1
+        self.fallback_ports_frame = ctk.CTkFrame(self.settings_scroll, fg_color="transparent", corner_radius=0)
+        self.fallback_ports_frame.grid(row=row, column=0, columnspan=3, sticky="ew", padx=8, pady=4)
+        self.fallback_ports_frame.grid_columnconfigure(1, weight=1)
+        self.fallback_port_entries = {}
+        for port_row, (key, label) in enumerate((("listen_port", "thy.listenport *"), ("metric_port", "thy.metricport *"))):
+            ctk.CTkLabel(self.fallback_ports_frame, text=label, anchor="w", font=ctk.CTkFont(size=12)).grid(
+                row=port_row, column=0, sticky="w", padx=(4, 10), pady=3)
+            self.setting_vars[key] = ctk.StringVar(value=self.config[key])
+            entry = ctk.CTkEntry(self.fallback_ports_frame, textvariable=self.setting_vars[key],
+                                height=30, placeholder_text="1-65535")
+            entry.grid(row=port_row, column=1, sticky="ew", pady=3)
+            self.fallback_port_entries[key] = entry
+        self.fallback_ports_frame.grid_remove()
+        row += 1
+        row = self._add_group_header("Datasources", row)
+        row = self._add_datasource_select("primary", row)
+        row = self._add_datasource_select("readonly", row)
+        row = self._add_checkbox("override_port", "Override Server Port", row, self.config["override_port"])
+        row = self._add_entry("server_port", "Server Port", row, self.config["server_port"], placeholder="8080")
+        self.settings_scroll = self.settings_pages["Overrides"]
+        row = self._add_group_header("Property Overrides", 0)
+        self._build_override_editor(row)
+
+        self.settings_scroll = self.settings_pages["Maven"]
+        row = self._add_group_header("Maven Operations", 0)
         mvn_btn_frame = ctk.CTkFrame(self.settings_scroll, fg_color="transparent")
         mvn_btn_frame.grid(row=row, column=0, columnspan=3, sticky="ew", padx=8, pady=4)
         mvn_btn_frame.grid_columnconfigure((0, 1, 2), weight=1)
@@ -373,7 +455,7 @@ class ProjectTab:
             ("Clean", "clean", "#2980b9", "#3498db"),
             ("Install", "install", "#2980b9", "#3498db"),
             ("Test", "test", "#2980b9", "#3498db"),
-            ("Custom...", "custom", "#8e44ad", "#9b59b6"),
+            ("Custom...", "custom", "#59636e", "#6c7986"),
         ]
         for i, (label, cmd, fg, hv) in enumerate(mvn_buttons):
             r, c = divmod(i, 3)
@@ -382,23 +464,41 @@ class ProjectTab:
                               fg_color=fg, hover_color=hv, command=action)
             b.grid(row=r, column=c, sticky="ew", padx=3, pady=2)
 
-        # --- Group: Java / Spring Boot ---
-        row = self._add_group_header("Java / Spring Boot", row)
-        row = self._add_entry("main_class", "Main Class", row, self.config["main_class"],
-                              placeholder="com.example.Application")
+        row = self._add_group_header("Maven Settings", row)
+        row = self._add_checkbox("skip_jacoco", "Skip JaCoCo", row, self.config["skip_jacoco"])
+        row = self._add_toolchain_select("maven", "Maven Home", row, self.config["maven_path"])
+        row = self._add_entry("maven_profiles", "Maven Profiles", row, self.config["maven_profiles"], placeholder="-P dev")
+        row = self._add_entry("maven_extra_args", "Extra Maven Args", row, self.config["maven_extra_args"], placeholder="-DskipTests")
+
+        self.settings_scroll = self.settings_pages["Runtime"]
+        row = self._add_group_header("Java / Spring Boot", 0)
+        main_frame = ctk.CTkFrame(self.settings_scroll, fg_color="transparent")
+        main_frame.grid(row=row, column=0, columnspan=3, sticky="ew", padx=8, pady=3)
+        main_frame.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(main_frame, text="Main Class", font=ctk.CTkFont(size=12)).grid(row=0, column=0, padx=(4, 10))
+        self.setting_vars["main_class"] = ctk.StringVar(value=self.config["main_class"])
+        self.main_class_menu = ctk.CTkComboBox(main_frame, variable=self.setting_vars["main_class"],
+                              values=[self.config["main_class"] or ""], height=30)
+        self.main_class_menu.grid(row=0, column=1, sticky="ew")
+        ctk.CTkButton(main_frame, text="Scan", width=48, height=30,
+                  command=self._schedule_main_class_scan).grid(row=0, column=2, padx=(4, 0))
+        row += 1
+        self.main_class_status = ctk.CTkLabel(self.settings_scroll, text="", anchor="w",
+                             font=ctk.CTkFont(size=11), wraplength=330)
+        self.main_class_status.grid(row=row, column=0, columnspan=3, sticky="ew", padx=12)
+        row += 1
         row = self._add_entry("vm_options", "VM Options", row, self.config["vm_options"],
                               placeholder="-Xmx512m -Xms256m")
         row = self._add_entry("program_args", "Program Args", row, self.config["program_args"])
         row = self._add_entry("spring_profile", "Spring Profile", row, self.config["spring_profile"],
                               placeholder="dev,local")
-        row = self._add_datasource_select("primary", row)
-        row = self._add_datasource_select("readonly", row)
-        row = self._add_checkbox("override_port", "Override Server Port", row,
-                                 self.config.get("override_port", False))
-        row = self._add_entry("server_port", "Server Port", row, self.config["server_port"],
-                              placeholder="e.g. 8080")
-
-        # --- Group: Logging ---
+        row = self._add_toolchain_select("java", "Java Home", row, self.config["java_path"])
+        row = self._add_group_header("Environment Variables", row)
+        self.environment_text = ctk.CTkTextbox(self.settings_scroll, height=150, corner_radius=6,
+                               font=ctk.CTkFont(family="Consolas", size=12), wrap="none")
+        self.environment_text.grid(row=row, column=0, columnspan=3, sticky="ew", padx=8, pady=4)
+        self.environment_text.insert("1.0", self.config["environment_variables"])
+        row += 1
         row = self._add_group_header("Logging", row)
         row = self._add_checkbox("console_logging", "Override logs to Console", row,
                                  self.config.get("console_logging", True))
@@ -406,34 +506,245 @@ class ProjectTab:
                       self.config.get("log_max_lines", "500"),
                       placeholder="500")
 
-        # --- Group: Debug ---
         row = self._add_group_header("Debug", row)
         row = self._add_checkbox("debug_enabled", "Enable Debug", row, self.config["debug_enabled"])
         row = self._add_entry("debug_port", "Debug Port", row, self.config["debug_port"],
                               placeholder="5005")
 
-        # --- Group: Maven Settings ---
-        row = self._add_group_header("Maven Settings", row)
-        row = self._add_checkbox("skip_jacoco", "Skip JaCoCo (recommended)", row,
-                                 self.config.get("skip_jacoco", True))
-        row = self._add_path_entry_with_default("maven_path", "Maven Home", row,
-                                                self.config["maven_path"], DEFAULT_MAVEN_PATH)
-        row = self._add_entry("maven_profiles", "Maven Profiles", row, self.config["maven_profiles"],
-                              placeholder="-P dev")
-        row = self._add_entry("maven_extra_args", "Extra Maven Args", row, self.config["maven_extra_args"],
-                              placeholder="-DskipTests")
-
-        # --- Group: Paths ---
-        row = self._add_group_header("Paths", row)
-        row = self._add_path_entry_with_default("java_path", "Java Home", row,
-                                                self.config["java_path"], DEFAULT_JAVA_PATH)
+        self.settings_scroll = self.settings_pages["Web"]
+        row = self._add_group_header("Node.js", 0)
         row = self._add_path_entry_with_default("node_path", "Node.js Home", row,
                                                 self.config["node_path"], DEFAULT_NODE_PATH)
-
-        # --- Group: NPM ---
-        row = self._add_group_header("NPM", row)
         row = self._add_entry("npm_script", "NPM Script", row, self.config["npm_script"],
                               placeholder="start")
+        self.setting_vars["config_repo_path"].trace_add("write", self._schedule_config_refresh)
+        self.setting_vars["project_type"].trace_add("write", self._project_type_changed)
+        self.setting_vars["project_path"].trace_add("write", self._schedule_main_class_scan)
+        self._refresh_config()
+        self._project_type_changed()
+        self.refresh_theme()
+
+    def refresh_theme(self):
+        dark = ctk.get_appearance_mode() == "Dark"
+        background = "#2b2b2b" if dark else "#e5e7e6"
+        self.log_outer_frame.configure(bg=background)
+        self.settings_outer_frame.configure(bg=background)
+        self.paned.configure(bg=background)
+        self.property_list.configure(bg="#202322" if dark else "#f6f8f7",
+                                     fg="#edf2ef" if dark else "#202a24")
+        for widget in [*self.section_headers, self.property_source, self.property_toggle]:
+            widget.configure(bg_color=("gray83", "gray17"))
+
+    def _project_type_changed(self, *_):
+        self.settings_views.set("Web" if self.setting_vars["project_type"].get() == "npm" else "Backend")
+        self._update_fallback_port_fields()
+        self._schedule_main_class_scan()
+
+    def _update_fallback_port_fields(self):
+        required = (self.loaded_config and self.loaded_config["requires_ports"]
+                    and self.setting_vars["project_type"].get() == "spring-boot")
+        if required:
+            self.fallback_ports_frame.grid()
+        else:
+            self.fallback_ports_frame.grid_remove()
+
+    def _schedule_main_class_scan(self, *_):
+        self._main_scan_generation += 1
+        folder = self.setting_vars["project_path"].get().strip()
+        if folder != self._main_class_project:
+            self._main_class_project = folder
+            self.setting_vars["main_class"].set("")
+            self.main_class_menu.configure(values=[""])
+        if self._main_class_job:
+            self.frame.after_cancel(self._main_class_job)
+        self._main_class_job = self.frame.after(400, self._start_main_class_scan)
+
+    def _start_main_class_scan(self):
+        if self._main_class_job:
+            self.frame.after_cancel(self._main_class_job)
+        self._main_class_job = None
+        if self.setting_vars["project_type"].get() != "spring-boot":
+            self.main_class_status.configure(text="")
+            return
+        folder = self.setting_vars["project_path"].get().strip()
+        if not folder or not os.path.isdir(folder):
+            self.main_class_status.configure(text="")
+            return
+        generation = self._main_scan_generation
+        self.main_class_status.configure(text="Scanning Spring Boot classes...", text_color="gray")
+
+        def scan():
+            candidates = find_spring_boot_classes(folder)
+            self._main_class_results.put((generation, folder, candidates))
+
+        self._main_class_thread = threading.Thread(target=scan, daemon=True)
+        self._main_class_thread.start()
+
+    def _consume_main_class_results(self):
+        while True:
+            try:
+                generation, folder, candidates = self._main_class_results.get_nowait()
+            except queue.Empty:
+                return
+            if (generation != self._main_scan_generation
+                    or folder != self.setting_vars["project_path"].get().strip()
+                    or self.setting_vars["project_type"].get() != "spring-boot"):
+                continue
+            self.main_class_menu.configure(values=candidates or [""])
+            current = self.setting_vars["main_class"].get()
+            if len(candidates) == 1:
+                self.setting_vars["main_class"].set(candidates[0])
+                self.main_class_status.configure(text="Spring Boot application detected", text_color=("#16724b", "#61cf9a"))
+            elif candidates:
+                if current not in candidates:
+                    self.setting_vars["main_class"].set("")
+                self.main_class_status.configure(text=f"{len(candidates)} Spring Boot applications found", text_color="#d08b39")
+            else:
+                self.setting_vars["main_class"].set("")
+                self.main_class_status.configure(text="No Spring Boot application found", text_color="gray")
+
+    def _schedule_config_refresh(self, *_):
+        if self._config_refresh_job:
+            self.frame.after_cancel(self._config_refresh_job)
+        self._config_refresh_job = self.frame.after(400, self._refresh_config)
+
+    def _effective_config_folder(self):
+        folder = self.setting_vars["config_repo_path"].get().strip()
+        environment = self.setting_vars["config_environment"].get()
+        return os.path.join(folder, environment) if environment not in ("", SELECTED_CONFIG_FOLDER) else folder
+
+    def _refresh_config(self):
+        self._config_refresh_job = None
+        folder = self.setting_vars["config_repo_path"].get().strip()
+        if not folder:
+            self.loaded_config = None
+            self.config_status.configure(text="No config selected", text_color="gray")
+            self._update_fallback_port_fields()
+            self._refresh_property_list()
+            return
+        try:
+            environments = [name or SELECTED_CONFIG_FOLDER for name in config_environments(folder)]
+            if not environments:
+                raise ValueError("Select a config folder or environment containing application YAML/properties")
+            self.environment_menu.configure(values=environments)
+            current = self.setting_vars["config_environment"].get()
+            if current not in environments:
+                self.setting_vars["config_environment"].set("test" if "test" in environments else environments[0])
+            self._reload_config_files()
+        except Exception as error:
+            self.loaded_config = None
+            self.config_status.configure(text=str(error), text_color="#e76f51")
+            self._update_fallback_port_fields()
+            self._refresh_property_list()
+
+    def _reload_config_files(self):
+        try:
+            files = config_files(self._effective_config_folder())
+            if not files:
+                raise ValueError("No application YAML/properties found in the selected folder")
+            self.config_file_menu.configure(values=files)
+            if self.setting_vars["config_filename"].get() not in files:
+                preferred = next((name for name in ("application.yml", "application.yaml", "application.properties") if name in files), files[0])
+                self.setting_vars["config_filename"].set(preferred)
+            self._load_config_fields()
+        except Exception as error:
+            self.loaded_config = None
+            self.config_status.configure(text=str(error), text_color="#e76f51")
+            self._update_fallback_port_fields()
+            self._refresh_property_list()
+
+    def _load_config_fields(self):
+        try:
+            self.loaded_config = load_config(self._effective_config_folder(), self.setting_vars["config_filename"].get())
+            self.property_overrides = {key: value for key, value in self.property_overrides.items()
+                                       if key in self.loaded_config["fields"]}
+            directory = self.loaded_config["directory"]
+            params_status = " | JVM params not found" if self.loaded_config["requires_ports"] else ""
+            self.config_status.configure(text=f"{directory.name} / {self.loaded_config['filename']}{params_status}",
+                                         text_color=("#16724b", "#61cf9a"))
+        except Exception as error:
+            self.loaded_config = None
+            self.config_status.configure(text=str(error), text_color="#e76f51")
+        self._update_fallback_port_fields()
+        self._refresh_property_list()
+
+    def _build_override_editor(self, row):
+        parent = self.settings_scroll
+        tools = ctk.CTkFrame(parent, fg_color="transparent")
+        tools.grid(row=row, column=0, columnspan=3, sticky="ew", padx=8, pady=4)
+        tools.grid_columnconfigure(0, weight=1)
+        self.property_search = ctk.StringVar()
+        ctk.CTkEntry(tools, textvariable=self.property_search, placeholder_text="Search properties", height=30).grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        ctk.CTkButton(tools, text="Reset", width=55, height=30, command=self._reset_property_overrides).grid(row=0, column=2)
+        self.property_search.trace_add("write", lambda *_: self._refresh_property_list())
+        self.property_list = tk.Listbox(parent, height=4, font=("Consolas", 11),
+                                         bg="#202322", fg="#edf2ef", selectbackground="#23734e",
+                                         selectforeground="white", borderwidth=0, highlightthickness=0,
+                                         exportselection=False, activestyle="none")
+        self.property_list.grid(row=row + 1, column=0, columnspan=2, sticky="ew", padx=(8, 0), pady=4)
+        scrollbar = ctk.CTkScrollbar(parent, height=80, command=self.property_list.yview)
+        scrollbar.grid(row=row + 1, column=2, sticky="ns", padx=(0, 8))
+        self.property_list.configure(yscrollcommand=scrollbar.set)
+        self.property_list.bind("<<ListboxSelect>>", self._select_property)
+        self.property_source = ctk.CTkLabel(parent, text="", anchor="w", wraplength=330, font=ctk.CTkFont(size=11))
+        self.property_source.grid(row=row + 2, column=0, columnspan=3, sticky="ew", padx=8)
+        self.property_enabled = ctk.BooleanVar(value=False)
+        self.property_toggle = ctk.CTkCheckBox(parent, text="Override", variable=self.property_enabled,
+                                              command=self._store_property_override, width=90)
+        self.property_toggle.grid(row=row + 3, column=0, sticky="w", padx=8, pady=4)
+        self.property_value = ctk.StringVar()
+        self.property_entry = ctk.CTkEntry(parent, textvariable=self.property_value, height=32, state="disabled")
+        self.property_entry.grid(row=row + 3, column=1, columnspan=2, sticky="ew", padx=8, pady=4)
+        self.property_value.trace_add("write", lambda *_: self._store_property_override())
+
+    def _refresh_property_list(self):
+        fields = self.loaded_config["fields"] if self.loaded_config else {}
+        search = self.property_search.get().strip().lower()
+        self._visible_properties = sorted(key for key in fields if search in key.lower())
+        self.property_list.delete(0, "end")
+        for key in self._visible_properties:
+            self.property_list.insert("end", ("* " if key in self.property_overrides else "  ") + key)
+        if self._selected_property in self._visible_properties:
+            index = self._visible_properties.index(self._selected_property)
+            self.property_list.selection_set(index)
+        elif self._visible_properties:
+            self.property_list.selection_set(0)
+        self._select_property()
+
+    def _select_property(self, event=None):
+        selection = self.property_list.curselection()
+        self._selected_property = self._visible_properties[selection[0]] if selection else None
+        self._editing_property = True
+        key = self._selected_property
+        fields = self.loaded_config["fields"] if self.loaded_config else {}
+        field = fields.get(key, {"value": "", "source": "custom"})
+        self.property_enabled.set(key in self.property_overrides if key else False)
+        self.property_value.set(self.property_overrides.get(key, field["value"]) if key else "")
+        self.property_entry.configure(show="*" if key and SECRET.search(key) else "",
+                                      state="normal" if key and self.property_enabled.get() else "disabled")
+        self.property_toggle.configure(state="normal" if key else "disabled")
+        self.property_source.configure(text=f"{key}\n{field['source']}" if key else "")
+        self._editing_property = False
+
+    def _store_property_override(self):
+        key = self._selected_property
+        if self._editing_property or not key:
+            return
+        if self.property_enabled.get():
+            self.property_overrides[key] = self.property_value.get()
+            self.property_entry.configure(state="normal")
+        else:
+            self.property_overrides.pop(key, None)
+            self._select_property()
+        index = self._visible_properties.index(key)
+        self.property_list.delete(index)
+        self.property_list.insert(index, ("* " if key in self.property_overrides else "  ") + key)
+        self.property_list.selection_set(index)
+
+    def _reset_property_overrides(self):
+        if self.property_overrides and messagebox.askyesno("Reset", "Remove all property overrides?"):
+            self.property_overrides.clear()
+            self._refresh_property_list()
 
     def _add_group_header(self, text, row):
         sep = ctk.CTkFrame(self.settings_scroll, height=1, fg_color=("gray75", "gray35"))
@@ -443,6 +754,7 @@ class ProjectTab:
                               font=ctk.CTkFont(size=13, weight="bold"),
                               text_color=("#1a5276", "#85c1e9"))
         header.grid(row=row, column=0, columnspan=3, sticky="w", padx=8, pady=(4, 6))
+        self.section_headers.append(header)
         return row + 1
 
     def _add_entry(self, key, label, row, default="", placeholder=None):
@@ -499,6 +811,30 @@ class ProjectTab:
 
         self.setting_vars[key] = var
         return row + 1
+
+    def _add_toolchain_select(self, kind, label, row, default):
+        ctk.CTkLabel(self.settings_scroll, text=label, anchor="w", font=ctk.CTkFont(size=12)).grid(
+            row=row, column=0, sticky="w", padx=(12, 5), pady=3)
+        inner = ctk.CTkFrame(self.settings_scroll, fg_color="transparent")
+        inner.grid(row=row, column=1, columnspan=2, sticky="ew", padx=(5, 8), pady=3)
+        inner.grid_columnconfigure(0, weight=1)
+        var = ctk.StringVar(value=default if default not in ("", "java", "mvn") else SYSTEM_TOOLCHAIN)
+        menu = ctk.CTkComboBox(inner, variable=var, values=[SYSTEM_TOOLCHAIN], height=30)
+        menu.grid(row=0, column=0, sticky="ew")
+        ctk.CTkButton(inner, text="📁", width=32, height=30,
+                      command=lambda: self._browse_path(var)).grid(row=0, column=1, padx=3)
+        ctk.CTkButton(inner, text="Scan", width=48, height=30,
+                      command=self.app._refresh_toolchains).grid(row=0, column=2)
+        self.setting_vars[f"{kind}_path"] = var
+        self.toolchain_menus[kind] = menu
+        self.refresh_toolchain_options()
+        return row + 1
+
+    def refresh_toolchain_options(self):
+        for kind, menu in self.toolchain_menus.items():
+            current = self.setting_vars[f"{kind}_path"].get()
+            values = list(dict.fromkeys([SYSTEM_TOOLCHAIN, *self.app.toolchains.get(kind, []), current]))
+            menu.configure(values=values)
 
     def _add_option_menu(self, key, label, row, values, default):
         lbl = ctk.CTkLabel(self.settings_scroll, text=label, anchor="w",
@@ -600,16 +936,22 @@ class ProjectTab:
     # ACTIONS
     # ========================
     def get_config(self):
-        cfg = {}
+        cfg = dict(self.config)
         for key, var in self.setting_vars.items():
             if key in ("primary_datasource_id", "readonly_datasource_id"):
                 category = key.removesuffix("_datasource_id")
                 datasource = self.app.get_datasource_by_label(var.get(), category)
                 cfg[key] = datasource.get("id", "") if datasource else ""
+            elif key in ("java_path", "maven_path") and var.get() == SYSTEM_TOOLCHAIN:
+                cfg[key] = DEFAULT_JAVA_PATH if key == "java_path" else DEFAULT_MAVEN_PATH
+            elif key == "config_environment" and var.get() == SELECTED_CONFIG_FOLDER:
+                cfg[key] = ""
             else:
                 cfg[key] = var.get()
         cfg["log_font_size"] = self._log_font_size
         cfg["sash_ratio"] = self._get_sash_ratio()
+        cfg["property_overrides"] = dict(self.property_overrides)
+        cfg["environment_variables"] = self.environment_text.get("1.0", "end-1c")
         return cfg
 
     def _get_java_cmd(self):
@@ -673,7 +1015,7 @@ class ProjectTab:
 
     def _get_env(self):
         """Build environment with JAVA_HOME and MAVEN_HOME if paths are set."""
-        env = {}
+        env = parse_environment(self.environment_text.get("1.0", "end-1c"))
         java_path = self.setting_vars["java_path"].get().strip()
         if java_path and os.path.isdir(java_path):
             env["JAVA_HOME"] = java_path
@@ -685,6 +1027,15 @@ class ProjectTab:
         if node_path and os.path.isdir(node_path):
             env["NODE_HOME"] = node_path
         return env if env else None
+
+    def _start_process(self, cmd, cwd, status, extra_env=None):
+        try:
+            env = {**(self._get_env() or {}), **(extra_env or {})}
+            if self.process_manager.run(cmd, cwd=cwd, env=env):
+                self._update_status(status)
+        except (ValueError, OSError) as error:
+            self._log(f"[ERROR] {error}\n")
+            self._update_status("stopped")
 
     def _get_npm_cmd(self):
         node_path = self.setting_vars["node_path"].get().strip()
@@ -708,40 +1059,26 @@ class ProjectTab:
         return self.app.get_datasource_by_label(var.get(), category)
 
     def _build_datasource_jvm_args(self):
-        mappings = [
-            ("jdbc_url", "jdbc-url"),
-            ("username", "username"),
-            ("password", "password"),
-            ("driver_class_name", "driver-class-name"),
-        ]
         args = []
         for category, prefix in (
             ("primary", "spring.datasource.primary"),
-            ("readonly", "spring.datasource.read-only-database"),
+            ("readonly", self.loaded_config["readonly_prefix"] if self.loaded_config else "spring.datasource.read-only-database"),
         ):
-            datasource = self._get_selected_datasource(category)
-            if not datasource:
-                continue
-            for source_key, property_name in mappings:
-                value = (datasource.get(source_key) or "").strip()
-                if value:
-                    args.append(f"-D{prefix}.{property_name}={value}")
+            properties = datasource_properties(self._get_selected_datasource(category), prefix)
+            args.extend(f"-D{key}={value}" for key, value in properties.items())
         return args
 
     def _command_for_log(self, cmd_parts):
-        command = " ".join(cmd_parts)
-        for token in (
-            "-Dspring.datasource.primary.password=",
-            "-Dspring.datasource.read-only-database.password=",
-        ):
-            start = command.find(token)
-            if start < 0:
-                continue
-            end = command.find(" ", start)
-            if end < 0:
-                end = len(command)
-            command = f"{command[:start]}{token}***{command[end:]}"
-        return command
+        safe = []
+        for part in cmd_parts:
+            key, separator, value = part.partition("=")
+            if separator and (SECRET.search(key) or key in (
+                "-Dspring-boot.run.jvmArguments", "-Dspring-boot.run.arguments",
+            )):
+                safe.append(f"{key}=<hidden>")
+            else:
+                safe.append(part)
+        return join_arguments(safe)
 
     def _log(self, text):
         self.output_queue.put(text)
@@ -764,6 +1101,7 @@ class ProjectTab:
             return self.DEFAULT_MAX_LOG_LINES
 
     def _poll_output(self):
+        self._consume_main_class_results()
         items = []
         try:
             while True:
@@ -799,7 +1137,7 @@ class ProjectTab:
             for s in status_items:
                 self._update_status(s[1])
 
-        self.frame.after(100, self._poll_output)
+        self._poll_job = self.frame.after(100, self._poll_output)
 
     def _update_status(self, status):
         if status == "running":
@@ -840,8 +1178,7 @@ class ProjectTab:
 
         self._log(f"[MAVEN] Running: {' '.join(cmd_parts)}\n")
         self._log(f"[MAVEN] Directory: {cwd}\n")
-        self._update_status("maven")
-        self.process_manager.run(cmd_parts, cwd=cwd, env=self._get_env())
+        self._start_process(cmd_parts, cwd, "maven")
 
     def _run_custom_maven(self):
         dialog = ctk.CTkInputDialog(text="Enter Maven command (e.g. 'compile package -DskipTests'):",
@@ -860,8 +1197,7 @@ class ProjectTab:
 
             cmd_parts = [mvn] + result.strip().split()
             self._log(f"[MAVEN] Running: {' '.join(cmd_parts)}\n")
-            self._update_status("maven")
-            self.process_manager.run(cmd_parts, cwd=cwd, env=self._get_env())
+            self._start_process(cmd_parts, cwd, "maven")
 
     def run_app(self):
         if self.process_manager.is_running():
@@ -874,10 +1210,14 @@ class ProjectTab:
             self._log("[ERROR] Project path is not set.\n")
             return
 
-        if project_type == "spring-boot":
-            self._run_spring_boot(cwd)
-        elif project_type == "npm":
-            self._run_npm(cwd)
+        try:
+            if project_type == "spring-boot":
+                self._run_spring_boot(cwd)
+            elif project_type == "npm":
+                self._run_npm(cwd)
+        except Exception as error:
+            self._log(f"[ERROR] Cannot start application: {error}\n")
+            self._update_status("stopped")
 
     def _run_spring_boot(self, cwd):
         main_class = self.setting_vars["main_class"].get().strip()
@@ -889,6 +1229,22 @@ class ProjectTab:
         debug_enabled = self.setting_vars["debug_enabled"].get()
         debug_port = self.setting_vars["debug_port"].get().strip()
 
+        self._load_config_fields()
+        if not self.loaded_config:
+            raise ValueError("Select a valid backend config repository/environment and config file")
+        datasource_jvm_args = self._build_datasource_jvm_args()
+        overrides = dict(self.property_overrides)
+        for argument in datasource_jvm_args:
+            key, _, value = argument[2:].partition("=")
+            overrides[key] = value
+        loaded, properties, jvm_args, launch_env = prepare_backend(
+            self._effective_config_folder(), self.setting_vars["config_filename"].get(),
+            self.setting_vars["app_directory"].get().strip(), overrides,
+            self.environment_text.get("1.0", "end-1c"), vm_options,
+            listen_port=self.setting_vars["listen_port"].get(),
+            metric_port=self.setting_vars["metric_port"].get(),
+        )
+
         mvn = self._get_maven_cmd()
         cmd_parts = [mvn, "spring-boot:run"]
 
@@ -897,9 +1253,6 @@ class ProjectTab:
         if skip_jacoco:
             cmd_parts.append("-Djacoco.skip=true")
 
-        jvm_args = []
-        if vm_options:
-            jvm_args.extend(vm_options.split())
         if debug_enabled and debug_port:
             # Java 8 uses address=5005, Java 9+ uses address=*:5005
             java_cmd = self._get_java_cmd()
@@ -914,30 +1267,32 @@ class ProjectTab:
         console_logging = self.setting_vars["console_logging"].get()
         if console_logging:
             config_path = CONSOLE_LOG4J2_CONFIG.replace("\\", "/")
-            jvm_args.append(f"-Dlogging.config=file:{config_path}")
-            jvm_args.append(f"-Dlog4j.configurationFile=file:{config_path}")
-
-        # Resolve placeholders such as ${database.url} from JVM system properties.
-        datasource_jvm_args = self._build_datasource_jvm_args()
-        if datasource_jvm_args:
-            jvm_args.extend(datasource_jvm_args)
+            properties["logging.config"] = f"file:{config_path}"
+            properties["log4j.configurationFile"] = f"file:{config_path}"
+        jvm_args.extend(f"-D{key}={value}" for key, value in properties.items())
 
         if main_class:
             cmd_parts.append(f"-Dspring-boot.run.mainClass={main_class}")
+        final_properties = {key: properties[key] for key in overrides}
+        final_properties.update(loaded["required_properties"])
+        final_properties.update({key: properties[key] for key in loaded["resource_properties"]})
+        final_properties["thy.appdir"] = properties["thy.appdir"]
+        final_properties["spring.config.additional-location"] = properties["spring.config.additional-location"]
         if spring_profile:
-            cmd_parts.append(f"-Dspring-boot.run.profiles={spring_profile}")
-
-        # Collect run arguments
-        run_args = []
+            final_properties["spring.profiles.active"] = spring_profile
+        if console_logging:
+            final_properties["logging.config"] = properties["logging.config"]
+            final_properties["log4j.configurationFile"] = properties["log4j.configurationFile"]
         if override_port and server_port:
-            run_args.append(f"--server.port={server_port}")
-        if program_args:
-            run_args.extend(program_args.split())
+            final_properties["server.port"] = server_port
+        run_args = [argument for argument in split_arguments(program_args)
+                    if not argument.startswith("--") or argument[2:].split("=", 1)[0] not in final_properties]
+        run_args.extend(f"--{key}={value}" for key, value in final_properties.items())
         if run_args:
-            cmd_parts.append(f"-Dspring-boot.run.arguments={','.join(run_args)}")
+            cmd_parts.append(f"-Dspring-boot.run.arguments={join_arguments(run_args)}")
 
         if jvm_args:
-            cmd_parts.append(f"-Dspring-boot.run.jvmArguments={' '.join(jvm_args)}")
+            cmd_parts.append(f"-Dspring-boot.run.jvmArguments={join_arguments(jvm_args)}")
 
         profiles = self.setting_vars["maven_profiles"].get().strip()
         if profiles:
@@ -946,6 +1301,7 @@ class ProjectTab:
         self._log(f"[RUN] Starting Spring Boot application...\n")
         self._log(f"[RUN] Command: {self._command_for_log(cmd_parts)}\n")
         self._log(f"[RUN] Directory: {cwd}\n")
+        self._log(f"[RUN] Config: {loaded['path']}\n")
         for category in ("primary", "readonly"):
             datasource = self._get_selected_datasource(category)
             if datasource:
@@ -955,8 +1311,7 @@ class ProjectTab:
             self._log("[RUN] Datasource properties injected as JVM system properties.\n")
         if debug_enabled:
             self._log(f"[RUN] Debug port: {debug_port} (attach IntelliJ remote debugger to this port)\n")
-        self._update_status("running")
-        self.process_manager.run(cmd_parts, cwd=cwd, env=self._get_env())
+        self._start_process(cmd_parts, cwd, "running", launch_env)
 
     def _run_npm(self, cwd):
         npm = self._get_npm_cmd()
@@ -966,8 +1321,7 @@ class ProjectTab:
         self._log(f"[RUN] Starting NPM application...\n")
         self._log(f"[RUN] Command: {' '.join(cmd_parts)}\n")
         self._log(f"[RUN] Directory: {cwd}\n")
-        self._update_status("running")
-        self.process_manager.run(cmd_parts, cwd=cwd, env=self._get_env())
+        self._start_process(cmd_parts, cwd, "running")
 
     def stop_process(self):
         if self.process_manager.is_running():
@@ -977,6 +1331,12 @@ class ProjectTab:
             self._log("[INFO] No running process.\n")
 
     def destroy(self):
+        if self._config_refresh_job:
+            self.frame.after_cancel(self._config_refresh_job)
+        if self._main_class_job:
+            self.frame.after_cancel(self._main_class_job)
+        self.frame.after_cancel(self._poll_job)
+        self.frame.after_cancel(self._sash_job)
         self.stop_process()
         self.frame.destroy()
 
@@ -988,7 +1348,12 @@ class AppLauncher(ctk.CTk):
         super().__init__()
         self.title(APP_TITLE)
         self.geometry("1400x800")
-        self.minsize(900, 500)
+        self.minsize(1000, 600)
+        icon_image = create_run_icon()
+        self.run_icon = ctk.CTkImage(light_image=icon_image, dark_image=icon_image, size=(18, 18))
+        from PIL import ImageTk
+        self._window_icon = ImageTk.PhotoImage(icon_image, master=self)
+        self.iconphoto(True, self._window_icon)
 
         # Set window icon
         icon_path = os.path.join(_BASE_DIR, "app_icon.ico")
@@ -1000,8 +1365,33 @@ class AppLauncher(ctk.CTk):
         self.tabs = {}  # tab_id -> ProjectTab
         self._current_theme = "dark"
         self.datasources = []
+        self.toolchains = {"java": [], "maven": []}
+        self._toolchain_results = queue.Queue()
+        self._toolchain_scan_running = False
 
         self._load_settings_and_build()
+        self._refresh_toolchains()
+
+    def _refresh_toolchains(self):
+        if self._toolchain_scan_running:
+            return
+        self._toolchain_scan_running = True
+
+        def scan():
+            self._toolchain_results.put(discover_toolchains())
+
+        threading.Thread(target=scan, daemon=True).start()
+        self.after(100, self._poll_toolchains)
+
+    def _poll_toolchains(self):
+        try:
+            self.toolchains = self._toolchain_results.get_nowait()
+        except queue.Empty:
+            self.after(100, self._poll_toolchains)
+            return
+        self._toolchain_scan_running = False
+        for info in self.tabs.values():
+            info["project"].refresh_toolchain_options()
 
     def _load_settings_and_build(self):
         saved = self._load_settings_file()
@@ -1035,7 +1425,7 @@ class AppLauncher(ctk.CTk):
         self.grid_columnconfigure(0, weight=1)
 
         # Top bar
-        topbar = ctk.CTkFrame(self, height=46, corner_radius=10, fg_color=("gray88", "gray18"))
+        topbar = ctk.CTkFrame(self, height=46, corner_radius=0, fg_color=("gray88", "gray18"))
         topbar.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 3))
 
         btn_add = ctk.CTkButton(topbar, text="+ New Tab", width=110, height=32, corner_radius=6,
@@ -1084,7 +1474,7 @@ class AppLauncher(ctk.CTk):
         btn_export.pack(side="right", padx=3, pady=7)
 
         # Tab view with larger segmented button
-        self.tabview = ctk.CTkTabview(self, corner_radius=10,
+        self.tabview = ctk.CTkTabview(self, corner_radius=6,
                                       segmented_button_fg_color=("gray80", "gray25"),
                                       segmented_button_selected_color=("#2980b9", "#2471a3"),
                                       segmented_button_unselected_color=("gray75", "gray30"),
@@ -1114,7 +1504,7 @@ class AppLauncher(ctk.CTk):
                     proj = tab_data["project"]
                     if not proj._sash_set:
                         proj._sash_retries = 0
-                        proj.frame.after(100, proj._set_initial_sash)
+                        proj._sash_job = proj.frame.after(100, proj._set_initial_sash)
                     break
         except Exception:
             pass
@@ -1195,6 +1585,8 @@ class AppLauncher(ctk.CTk):
             self._current_theme = "dark"
             ctk.set_appearance_mode("dark")
             self.theme_btn.configure(text="🌙 Dark")
+        for info in self.tabs.values():
+            info["project"].refresh_theme()
 
     # ========================
     # DATASOURCES
@@ -1422,6 +1814,7 @@ class AppLauncher(ctk.CTk):
                 "config": info["project"].get_config(),
             })
         return {
+            "schema_version": 2,
             "theme": self._current_theme,
             "geometry": self.geometry(),
             "datasources": self.datasources,
@@ -1487,6 +1880,11 @@ class AppLauncher(ctk.CTk):
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
+                if not isinstance(data, dict) or not isinstance(data.get("tabs", []), list):
+                    raise ValueError("Invalid settings backup")
+                for tab in data.get("tabs", []):
+                    if not isinstance(tab, dict) or not isinstance(tab.get("config", {}), dict):
+                        raise ValueError("Invalid project in settings backup")
 
                 # Close all tabs
                 for tid in list(self.tabs.keys()):
@@ -1506,6 +1904,7 @@ class AppLauncher(ctk.CTk):
                 if not self.tabs:
                     self._add_tab()
 
+                self._save_settings()
                 messagebox.showinfo("Import", "Settings imported successfully.")
             except Exception as e:
                 messagebox.showerror("Error", f"Import failed: {e}")
@@ -1541,9 +1940,6 @@ class AppLauncher(ctk.CTk):
                         proc.kill()
                     except Exception:
                         pass
-
-        self._save_settings()
-        self.destroy()
 
         self._save_settings()
         self.destroy()
